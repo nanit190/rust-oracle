@@ -255,6 +255,12 @@ where
     pub fn dequeue(&self) -> Result<MsgProps<T>> {
         let mut props = ptr::null_mut();
         chkerr!(self.ctxt(), dpiQueue_deqOne(self.handle(), &mut props));
+
+        // SPECIAL CASE: In case when the message wait timeout (dpiDeqOptions_setWait) is set to non-infinity,
+        // timeout during call to dpiQueue_deqOne will lead to DPI_SUCCESS function return code,
+        // BUT props will be NULL, and error state will be set to ORA-25228. We should check fpr that too.
+        if props.is_null() { return Err(crate::error::error_from_context(self.ctxt())); }
+
         Ok(MsgProps::from_dpi_msg_props(
             self.conn.clone(),
             DpiMsgProps::new(props),
