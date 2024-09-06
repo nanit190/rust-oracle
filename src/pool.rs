@@ -22,13 +22,13 @@ use crate::binding::*;
 use crate::chkerr;
 use crate::conn::Purity;
 use crate::connection::CommonCreateParamsBuilder;
-use crate::to_odpi_str;
 use crate::AssertSend;
 use crate::AssertSync;
 use crate::Connection;
 use crate::Context;
 use crate::DpiPool;
 use crate::Error;
+use crate::OdpiStr;
 use crate::Privilege;
 use crate::Result;
 use std::convert::TryInto;
@@ -99,13 +99,13 @@ impl GetMode {
 
     fn to_wait_timeout(self) -> Result<Option<u32>> {
         if let GetMode::TimedWait(ref dur) = self {
-            if let Ok(msecs) = dur.as_millis().try_into() {
-                Ok(Some(msecs))
-            } else {
-                Err(Error::OutOfRange(format!(
-                    "Too long timed wait duration {:?}",
+            match dur.as_millis().try_into() {
+                Ok(msecs) => Ok(Some(msecs)),
+                Err(err) => Err(Error::out_of_range(format!(
+                    "too long timed wait duration {:?}",
                     dur
-                )))
+                ))
+                .add_source(err)),
             }
         } else {
             Ok(None)
@@ -137,7 +137,9 @@ impl I32Seconds {
         if let Some(dur) = dur {
             match dur.as_secs().try_into() {
                 Ok(secs) => Ok(I32Seconds(secs)),
-                Err(_) => Err(Error::OutOfRange(format!("Too long {} {:?}", msg, dur))),
+                Err(err) => {
+                    Err(Error::out_of_range(format!("too long {} {:?}", msg, dur)).add_source(err))
+                }
             }
         } else {
             Ok(I32Seconds(-1))
@@ -240,14 +242,14 @@ impl PoolOptions {
             conn_params.authMode |= privilege.to_dpi();
         }
         conn_params.externalAuth = i32::from(self.external_auth);
-        let s = to_odpi_str(&self.tag);
+        let s = OdpiStr::new(&self.tag);
         conn_params.tag = s.ptr;
         conn_params.tagLength = s.len;
         conn_params.matchAnyTag = i32::from(self.match_any_tag);
         if let Some(purity) = self.purity {
             conn_params.purity = purity.to_dpi();
         }
-        let s = to_odpi_str(&self.connection_class);
+        let s = OdpiStr::new(&self.connection_class);
         conn_params.connectionClass = s.ptr;
         conn_params.connectionClassLength = s.len;
         conn_params
@@ -261,7 +263,9 @@ impl U32Seconds {
     fn try_from(dur: Duration, msg: &str) -> Result<U32Seconds> {
         match dur.as_secs().try_into() {
             Ok(secs) => Ok(U32Seconds(secs)),
-            Err(_) => Err(Error::OutOfRange(format!("Too long {} {:?}", msg, dur))),
+            Err(err) => {
+                Err(Error::out_of_range(format!("too long {} {:?}", msg, dur)).add_source(err))
+            }
         }
     }
 }
@@ -273,7 +277,9 @@ impl U32Milliseconds {
     fn try_from(dur: Duration, msg: &str) -> Result<U32Milliseconds> {
         match dur.as_millis().try_into() {
             Ok(secs) => Ok(U32Milliseconds(secs)),
-            Err(_) => Err(Error::OutOfRange(format!("Too long {} {:?}", msg, dur))),
+            Err(err) => {
+                Err(Error::out_of_range(format!("too long {} {:?}", msg, dur)).add_source(err))
+            }
         }
     }
 }
@@ -498,7 +504,7 @@ impl PoolBuilder {
             pool_params.maxLifetimeSession = val.0;
         }
         if let Some(ref val) = self.plsql_fixup_callback {
-            let s = to_odpi_str(val);
+            let s = OdpiStr::new(val);
             pool_params.plsqlFixupCallback = s.ptr;
             pool_params.plsqlFixupCallbackLength = s.len;
         }
@@ -554,9 +560,9 @@ impl PoolBuilder {
     /// Make a connection pool
     pub fn build(&self) -> Result<Pool> {
         let ctxt = Context::new0()?;
-        let username = to_odpi_str(&self.username);
-        let password = to_odpi_str(&self.password);
-        let connect_string = to_odpi_str(&self.connect_string);
+        let username = OdpiStr::new(&self.username);
+        let password = OdpiStr::new(&self.password);
+        let connect_string = OdpiStr::new(&self.connect_string);
         let common_params = self.common_params.build(&ctxt);
         let mut pool_params = self.to_dpi_pool_create_params(&ctxt)?;
         let mut handle = ptr::null_mut();
@@ -730,8 +736,8 @@ impl Pool {
     /// See also [`Pool::get`].
     pub fn get_with_options(&self, options: &PoolOptions) -> Result<Connection> {
         let ctxt = Context::new()?;
-        let username = to_odpi_str(&options.username);
-        let password = to_odpi_str(&options.password);
+        let username = OdpiStr::new(&options.username);
+        let password = OdpiStr::new(&options.password);
         let mut conn_params = options.to_dpi_conn_create_params(&ctxt);
         let mut handle = ptr::null_mut();
         chkerr!(
@@ -803,7 +809,7 @@ impl Pool {
                 chkerr!(self.ctxt(), dpiPool_getWaitTimeout(self.handle(), &mut val));
                 Ok(GetMode::TimedWait(Duration::from_millis(val.into())))
             }
-            _ => Err(Error::InternalError(format!(
+            _ => Err(Error::internal_error(format!(
                 "unknown dpiPoolGetMode {}",
                 val
             ))),

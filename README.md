@@ -23,7 +23,7 @@ See [ChangeLog.md](https://github.com/kubo/rust-oracle/blob/master/ChangeLog.md)
 The oracle crate supports **at least** 6 rust minor versions including the stable
 release at the time when the crate was released. The MSRV (minimum supported
 rust version) may be changed when a patch version is incremented though it will
-not be changed frequently. The current MSRV is 1.54.0.
+not be changed frequently. The current MSRV is 1.60.0.
 
 ## Usage
 
@@ -31,7 +31,7 @@ Put this in your `Cargo.toml`:
 
 ```text
 [dependencies]
-oracle = "0.5"
+oracle = "0.6.2"
 ```
 ## Optional Features
 
@@ -40,7 +40,7 @@ The following features can be enabled from Cargo.toml:
 Feature	| Description | available version
 ---|---|---
 `chrono` | Implements [`ToSql`] and [`FromSql`] for [chrono] data types. | any
-`stmt_without_lifetime` | Removes `conn` lifetime from [`Statement`]. This is available to avoid lifetime conflicts. | since&nbsp;0.5.6
+`stmt_without_lifetime` | Removes `conn` lifetime from [`Statement`]. This is available to avoid lifetime conflicts. | 0.5.7&nbsp;only
 `aq_unstable` | Enables [Oracle Advanced Queuing support][aq]. This is unstable. It may be changed incompatibly by minor version upgrades. | since&nbsp;0.5.5
 
 ## Examples
@@ -252,9 +252,10 @@ Other crates for connecting to Oracle:
 * [Sibyl]: an OCI-based interface supporting both blocking (threads) and nonblocking (async) API
 
 Oracle-related crates:
-* [r2d2-oracle]: Oracle support for the [r2d2] connection pool
 * [bb8-oracle]: [bb8] connection pool support for oracle
+* [diesel-oci]: A Oracle SQL database backend implementation for [Diesel][diesel]
 * [include-oracle-sql]: an extension of [include-sql] using [Sibyl] for database access
+* [r2d2-oracle]: Oracle support for the [r2d2] connection pool
 
 ## License
 
@@ -278,6 +279,8 @@ Rust-oracle and ODPI-C bundled in rust-oracle are under the terms of:
 [chrono]: https://docs.rs/chrono/0.4/chrono/
 [include-sql]: https://crates.io/crates/include-sql
 [include-oracle-sql]: https://crates.io/crates/include-oracle-sql
+[diesel]: https://diesel.rs/
+[diesel-oci]: https://github.com/GiGainfosystems/diesel-oci/
 [r2d2]: https://crates.io/crates/r2d2
 [r2d2-oracle]: https://crates.io/crates/r2d2-oracle
 [Sibyl]: https://crates.io/crates/sibyl

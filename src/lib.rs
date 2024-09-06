@@ -54,8 +54,10 @@ pub use crate::connection::Privilege;
 pub use crate::connection::ShutdownMode;
 pub use crate::connection::StartupMode;
 use crate::context::Context;
+pub use crate::context::InitParams;
 pub use crate::error::DbError;
 pub use crate::error::Error;
+pub use crate::error::ErrorKind;
 pub use crate::error::ParseOracleTypeError;
 pub use crate::row::ResultSet;
 pub use crate::row::Row;
@@ -67,7 +69,6 @@ pub use crate::statement::ColumnInfo;
 pub use crate::statement::Statement;
 pub use crate::statement::StatementBuilder;
 pub use crate::statement::StatementType;
-pub use crate::statement::StmtParam;
 pub use crate::version::Version;
 pub use oracle_procmacro::RowValue;
 
@@ -77,7 +78,23 @@ pub type Result<T> = result::Result<T, Error>;
 
 macro_rules! define_dpi_data_with_refcount {
     ($name:ident) => {
+        define_dpi_data_with_refcount!(__define_struct__, $name);
         paste::item! {
+            unsafe impl Send for [<Dpi $name>] {}
+            unsafe impl Sync for [<Dpi $name>] {}
+        }
+    };
+
+    ($name:ident, nosync) => {
+        define_dpi_data_with_refcount!(__define_struct__, $name);
+        paste::item! {
+            unsafe impl Send for [<Dpi $name>] {}
+        }
+    };
+
+    (__define_struct__, $name:ident) => {
+        paste::item! {
+            #[derive(Debug)]
             struct [<Dpi $name>] {
                 raw: *mut [<dpi $name>],
             }
@@ -93,6 +110,18 @@ macro_rules! define_dpi_data_with_refcount {
                     [<Dpi $name>] { raw }
                 }
 
+                #[allow(dead_code)]
+                fn null() -> [<Dpi $name>] {
+                    [<Dpi $name>] {
+                        raw: ptr::null_mut(),
+                    }
+                }
+
+                #[allow(dead_code)]
+                fn is_null(&self) -> bool {
+                    self.raw.is_null()
+                }
+
                 pub(crate) fn raw(&self) -> *mut [<dpi $name>] {
                     self.raw
                 }
@@ -100,19 +129,20 @@ macro_rules! define_dpi_data_with_refcount {
 
             impl Clone for [<Dpi $name>] {
                 fn clone(&self) -> [<Dpi $name>] {
-                    unsafe { [<dpi $name _addRef>](self.raw()) };
+                    if !self.is_null() {
+                        unsafe { [<dpi $name _addRef>](self.raw()) };
+                    }
                     [<Dpi $name>]::new(self.raw())
                 }
             }
 
             impl Drop for [<Dpi $name>] {
                 fn drop(&mut self) {
-                    unsafe { [<dpi $name _release>](self.raw()) };
+                   if !self.is_null() {
+                       unsafe { [<dpi $name _release>](self.raw()) };
+                   }
                 }
             }
-
-            unsafe impl Send for [<Dpi $name>] {}
-            unsafe impl Sync for [<Dpi $name>] {}
         }
     };
 }
@@ -135,7 +165,46 @@ define_dpi_data_with_refcount!(ObjectAttr);
 // define DpiQueue wrapping *mut dpiQueue.
 define_dpi_data_with_refcount!(Queue);
 
+// define DpiObject wrapping *mut dpiObject.
+define_dpi_data_with_refcount!(Object, nosync);
+
+// define DpiStmt wrapping *mut dpiStmt.
+define_dpi_data_with_refcount!(Stmt, nosync);
+
+// define DpiVar wrapping *mut dpiVar.
+struct DpiVar {
+    raw: *mut dpiVar,
+    data: *mut dpiData,
+}
+
+impl DpiVar {
+    fn new(raw: *mut dpiVar, data: *mut dpiData) -> DpiVar {
+        DpiVar { raw, data }
+    }
+
+    fn with_add_ref(raw: *mut dpiVar, data: *mut dpiData) -> DpiVar {
+        unsafe { dpiVar_addRef(raw) };
+        DpiVar::new(raw, data)
+    }
+
+    fn is_null(&self) -> bool {
+        self.raw.is_null()
+    }
+}
+
+impl Drop for DpiVar {
+    fn drop(&mut self) {
+        if !self.is_null() {
+            unsafe { dpiVar_release(self.raw) };
+        }
+    }
+}
+
+unsafe impl Send for DpiVar {}
+
+#[allow(dead_code)]
 trait AssertSend: Send {}
+#[allow(dead_code)]
 trait AssertSync: Sync {}
 
 //
@@ -147,28 +216,25 @@ struct OdpiStr {
     pub len: u32,
 }
 
-fn new_odpi_str() -> OdpiStr {
-    OdpiStr {
-        ptr: ptr::null(),
-        len: 0,
-    }
-}
-
-fn to_odpi_str(s: &str) -> OdpiStr {
-    if s.is_empty() {
-        OdpiStr {
-            ptr: ptr::null(),
-            len: 0,
-        }
-    } else {
-        OdpiStr {
-            ptr: s.as_ptr() as *const c_char,
-            len: s.len() as u32,
-        }
-    }
-}
-
 impl OdpiStr {
+    fn new<T>(s: T) -> OdpiStr
+    where
+        T: AsRef<[u8]>,
+    {
+        let s = s.as_ref();
+        if s.is_empty() {
+            OdpiStr {
+                ptr: ptr::null(),
+                len: 0,
+            }
+        } else {
+            OdpiStr {
+                ptr: s.as_ptr() as *const c_char,
+                len: s.len() as u32,
+            }
+        }
+    }
+
     #[allow(clippy::inherent_to_string)]
     pub fn to_string(&self) -> String {
         to_rust_str(self.ptr, self.len)
@@ -217,7 +283,7 @@ mod private {
     impl Sealed for str {}
     impl Sealed for [u8] {}
     impl Sealed for *mut c_void {}
-    impl<'a> Sealed for &'a str {}
+    impl Sealed for &str {}
 }
 
 #[allow(dead_code)]

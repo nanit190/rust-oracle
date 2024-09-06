@@ -16,33 +16,33 @@
 use std::fmt;
 use std::iter::FusedIterator;
 use std::marker::PhantomData;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::sql_type::FromSql;
 use crate::statement::Stmt;
+use crate::AssertSend;
 use crate::ColumnIndex;
 use crate::ColumnInfo;
+#[cfg(doc)]
+use crate::Connection;
 use crate::Result;
 use crate::SqlValue;
-
-#[allow(unused_imports)] // for links in doc comments
-use crate::Connection;
-
-pub struct RowSharedData {
-    column_names: Vec<String>,
-}
+#[cfg(doc)]
+use crate::Statement;
 
 /// Row in a result set of a select statement
 pub struct Row {
-    pub(crate) shared: Rc<RowSharedData>,
-    pub(crate) column_values: Vec<SqlValue>,
+    pub(crate) column_info: Arc<Vec<ColumnInfo>>,
+    pub(crate) column_values: Vec<SqlValue<'static>>,
 }
 
 impl Row {
-    pub(crate) fn new(column_names: Vec<String>, column_values: Vec<SqlValue>) -> Result<Row> {
-        let shared = RowSharedData { column_names };
+    pub(crate) fn new(
+        column_info: Vec<ColumnInfo>,
+        column_values: Vec<SqlValue<'static>>,
+    ) -> Result<Row> {
         Ok(Row {
-            shared: Rc::new(shared),
+            column_info: Arc::new(column_info),
             column_values,
         })
     }
@@ -53,7 +53,7 @@ impl Row {
         I: ColumnIndex,
         T: FromSql,
     {
-        let pos = colidx.idx(&self.shared.column_names)?;
+        let pos = colidx.idx(&self.column_info)?;
         self.column_values[pos].get()
     }
 
@@ -87,13 +87,19 @@ impl Row {
     {
         <T>::get(self)
     }
+
+    pub fn column_info(&self) -> &[ColumnInfo] {
+        &self.column_info
+    }
 }
+
+impl AssertSend for Row {}
 
 impl fmt::Debug for Row {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "Row {{ ")?;
-        for (name, value) in self.shared.column_names.iter().zip(&self.column_values) {
-            write!(f, "{}: {:?} ", name, value)?;
+        for (info, value) in self.column_info.iter().zip(&self.column_values) {
+            write!(f, "{}: {:?} ", info.name(), value)?;
         }
         write!(f, "}}")
     }
@@ -101,11 +107,30 @@ impl fmt::Debug for Row {
 
 #[derive(Debug)]
 enum StmtHolder<'a> {
-    Borrowed(&'a Stmt),
+    Borrowed(&'a mut Stmt),
     Owned(Stmt),
 }
 
 /// Result set
+///
+/// # Remarks
+///
+/// The lifetime parameter `'a` is `'static` when this type is created by the following methods.
+///
+/// * [`Connection::query()`]
+/// * [`Connection::query_named()`]
+/// * [`Connection::query_as()`]
+/// * [`Connection::query_as_named()`]
+/// * [`Statement::into_result_set()`]
+/// * [`Statement::into_result_set_named()`]
+///
+/// On the other hand, `'a` refers to [`Statement`] when it is created by the following methods.
+///
+/// * [`Statement::query()`]
+/// * [`Statement::query_named()`]
+/// * [`Statement::query_as()`]
+/// * [`Statement::query_as_named()`]
+///
 #[derive(Debug)]
 pub struct ResultSet<'a, T>
 where
@@ -119,7 +144,7 @@ impl<'a, T> ResultSet<'a, T>
 where
     T: RowValue,
 {
-    pub(crate) fn new(stmt: &'a Stmt) -> ResultSet<'a, T> {
+    pub(crate) fn new(stmt: &'a mut Stmt) -> ResultSet<'a, T> {
         ResultSet {
             stmt: StmtHolder::Borrowed(stmt),
             phantom: PhantomData,
@@ -135,15 +160,24 @@ where
 
     fn stmt(&self) -> &Stmt {
         match self.stmt {
-            StmtHolder::Borrowed(stmt) => stmt,
+            StmtHolder::Borrowed(ref stmt) => stmt,
             StmtHolder::Owned(ref stmt) => stmt,
         }
     }
 
+    fn stmt_mut(&mut self) -> &mut Stmt {
+        match self.stmt {
+            StmtHolder::Borrowed(ref mut stmt) => stmt,
+            StmtHolder::Owned(ref mut stmt) => stmt,
+        }
+    }
+
     pub fn column_info(&self) -> &[ColumnInfo] {
-        &self.stmt().column_info
+        &self.stmt().row.as_ref().unwrap().column_info
     }
 }
+
+unsafe impl<T> Send for ResultSet<'static, T> where T: RowValue {}
 
 impl<'stmt, T> Iterator for ResultSet<'stmt, T>
 where
@@ -152,7 +186,7 @@ where
     type Item = Result<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.stmt()
+        self.stmt_mut()
             .next()
             .map(|row_result| row_result.and_then(|row| row.get_as::<T>()))
     }
@@ -227,10 +261,10 @@ impl RowValue for Row {
         let num_cols = row.column_values.len();
         let mut column_values = Vec::with_capacity(num_cols);
         for val in &row.column_values {
-            column_values.push(val.dup_by_handle()?);
+            column_values.push(val.clone_except_fetch_array_buffer()?);
         }
         Ok(Row {
-            shared: row.shared.clone(),
+            column_info: row.column_info.clone(),
             column_values,
         })
     }

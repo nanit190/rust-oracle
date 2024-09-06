@@ -16,7 +16,7 @@
 use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fmt;
-use std::mem::{self, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use std::time::Duration;
 use crate::binding::*;
 use crate::chkerr;
 use crate::conn::{CloseMode, Purity};
-use crate::new_odpi_str;
+use crate::error::DPI_ERR_NOT_CONNECTED;
 use crate::oci_attr::data_type::{AttrValue, DataType};
 use crate::oci_attr::handle::ConnHandle;
 use crate::oci_attr::handle::Server;
@@ -38,9 +38,7 @@ use crate::pool::PoolOptions;
 use crate::sql_type::ObjectType;
 use crate::sql_type::ObjectTypeInternal;
 use crate::sql_type::ToSql;
-use crate::to_odpi_str;
 use crate::to_rust_str;
-use crate::util::duration_to_msecs;
 use crate::AssertSend;
 use crate::AssertSync;
 #[cfg(doc)]
@@ -50,13 +48,13 @@ use crate::Context;
 use crate::DpiConn;
 use crate::DpiObjectType;
 use crate::Error;
+use crate::OdpiStr;
 use crate::Result;
 use crate::ResultSet;
 use crate::Row;
 use crate::RowValue;
 use crate::Statement;
 use crate::StatementBuilder;
-use crate::StmtParam;
 use crate::Version;
 
 struct ServerStatus;
@@ -209,12 +207,12 @@ impl CommonCreateParamsBuilder {
             common_params.createMode |= DPI_MODE_CREATE_EVENTS;
         }
         if let Some(ref s) = self.edition {
-            let s = to_odpi_str(s);
+            let s = OdpiStr::new(s);
             common_params.edition = s.ptr;
             common_params.editionLength = s.len;
         }
         if let Some(ref s) = self.driver_name {
-            let s = to_odpi_str(s);
+            let s = OdpiStr::new(s);
             common_params.driverName = s.ptr;
             common_params.driverNameLength = s.len;
         }
@@ -491,20 +489,20 @@ impl Connector {
         if self.prelim_auth {
             conn_params.authMode |= DPI_MODE_AUTH_PRELIM;
         }
-        let s = to_odpi_str(&self.new_password);
+        let s = OdpiStr::new(&self.new_password);
         conn_params.newPassword = s.ptr;
         conn_params.newPasswordLength = s.len;
         if let Some(purity) = self.purity {
             conn_params.purity = purity.to_dpi();
         }
-        let s = to_odpi_str(&self.connection_class);
+        let s = OdpiStr::new(&self.connection_class);
         conn_params.connectionClass = s.ptr;
         conn_params.connectionClassLength = s.len;
         let mut app_context = Vec::with_capacity(self.app_context.len());
         for ac in &self.app_context {
-            let namespace = to_odpi_str(&ac.0);
-            let name = to_odpi_str(&ac.1);
-            let value = to_odpi_str(&ac.2);
+            let namespace = OdpiStr::new(&ac.0);
+            let name = OdpiStr::new(&ac.1);
+            let value = OdpiStr::new(&ac.2);
             app_context.push(dpiAppContext {
                 namespaceName: namespace.ptr,
                 namespaceNameLength: namespace.len,
@@ -642,9 +640,9 @@ impl Connection {
         common_params: dpiCommonCreateParams,
         mut conn_params: dpiConnCreateParams,
     ) -> Result<Connection> {
-        let username = to_odpi_str(username);
-        let password = to_odpi_str(password);
-        let connect_string = to_odpi_str(connect_string);
+        let username = OdpiStr::new(username);
+        let password = OdpiStr::new(password);
+        let connect_string = OdpiStr::new(connect_string);
         let mut handle = ptr::null_mut();
         chkerr!(
             &ctxt,
@@ -701,7 +699,7 @@ impl Connection {
             CloseMode::Drop => (DPI_MODE_CONN_CLOSE_DROP, ""),
             CloseMode::Retag(tag) => (DPI_MODE_CONN_CLOSE_RETAG, tag),
         };
-        let tag = to_odpi_str(tag);
+        let tag = OdpiStr::new(tag);
         chkerr!(
             self.ctxt(),
             dpiConn_close(self.handle(), mode, tag.ptr, tag.len)
@@ -788,73 +786,6 @@ impl Connection {
         StatementBuilder::new(self, sql)
     }
 
-    /// Creates a [`Statement`][] with parameters
-    ///
-    /// This will be marked as [deprecated][] at version 0.6.x. Please use [`statement(sql).build()`](#method.statement)
-    /// instead. The `statement()` method was added to follow [this API guideline](https://rust-lang.github.io/api-guidelines/type-safety.html#c-builder).
-    ///
-    /// [deprecated]: https://doc.rust-lang.org/edition-guide/rust-2018/the-compiler/an-attribute-for-deprecation.html
-    ///
-    /// # Examples
-    ///
-    /// Executes a SQL statement with different parameters.
-    ///
-    /// ```no_run
-    /// # use oracle::*;
-    /// # #[allow(deprecated)]
-    /// # fn main() -> Result<()> {
-    /// # let conn = Connection::connect("scott", "tiger", "")?;
-    /// let mut stmt = conn.prepare("insert into emp(empno, ename) values (:id, :name)", &[])?;
-    ///
-    /// let emp_list = [
-    ///     (7369, "Smith"),
-    ///     (7499, "Allen"),
-    ///     (7521, "Ward"),
-    /// ];
-    ///
-    /// // insert rows using positional parameters
-    /// for emp in &emp_list {
-    ///    stmt.execute(&[&emp.0, &emp.1])?;
-    /// }
-    ///
-    /// let emp_list = [
-    ///     (7566, "Jones"),
-    ///     (7654, "Martin"),
-    ///     (7698, "Blake"),
-    /// ];
-    ///
-    /// // insert rows using named parameters
-    /// for emp in &emp_list {
-    ///    stmt.execute_named(&[("id", &emp.0), ("name", &emp.1)])?;
-    /// }
-    /// # Ok(()) }
-    /// ```
-    ///
-    /// Query methods in Connection allocate memory for 100 rows by default
-    /// to reduce the number of network round trips in case that many rows are
-    /// fetched. When 100 isn't preferable, use `StmtParam::FetchArraySize(u32)`
-    /// to customize it.
-    ///
-    /// ```no_run
-    /// # use oracle::*;
-    /// # #[allow(deprecated)]
-    /// # fn main() -> Result<()> {
-    /// # let conn = Connection::connect("scott", "tiger", "")?;
-    /// // fetch top 10 rows.
-    /// let mut stmt = conn.prepare("select * from (select empno, ename from emp order by empno) where rownum <= 10",
-    ///                             &[StmtParam::FetchArraySize(10)])?;
-    /// for row_result in stmt.query_as::<(i32, String)>(&[])? {
-    ///     let (empno, ename) = row_result?;
-    ///     println!("empno: {}, ename: {}", empno, ename);
-    /// }
-    /// # Ok(()) }
-    /// ```
-    ///
-    #[deprecated]
-    pub fn prepare(&self, sql: &str, params: &[StmtParam]) -> Result<Statement> {
-        Statement::from_params(self, sql, params)
-    }
-
     /// Creates [BatchBuilder][]
     ///
     /// See [`Batch`].
@@ -871,7 +802,7 @@ impl Connection {
     /// See [Query Methods][].
     ///
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
-    pub fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<ResultSet<Row>> {
+    pub fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<ResultSet<'static, Row>> {
         let mut stmt = self.statement(sql).build()?;
         stmt.exec(params, true, "query")?;
         Ok(ResultSet::<Row>::from_stmt(stmt.stmt))
@@ -882,7 +813,11 @@ impl Connection {
     /// See [Query Methods][].
     ///
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
-    pub fn query_named(&self, sql: &str, params: &[(&str, &dyn ToSql)]) -> Result<ResultSet<Row>> {
+    pub fn query_named(
+        &self,
+        sql: &str,
+        params: &[(&str, &dyn ToSql)],
+    ) -> Result<ResultSet<'static, Row>> {
         let mut stmt = self.statement(sql).build()?;
         stmt.exec_named(params, true, "query_named")?;
         Ok(ResultSet::<Row>::from_stmt(stmt.stmt))
@@ -893,7 +828,7 @@ impl Connection {
     /// See [Query Methods][].
     ///
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
-    pub fn query_as<T>(&self, sql: &str, params: &[&dyn ToSql]) -> Result<ResultSet<T>>
+    pub fn query_as<T>(&self, sql: &str, params: &[&dyn ToSql]) -> Result<ResultSet<'static, T>>
     where
         T: RowValue,
     {
@@ -911,7 +846,7 @@ impl Connection {
         &self,
         sql: &str,
         params: &[(&str, &dyn ToSql)],
-    ) -> Result<ResultSet<T>>
+    ) -> Result<ResultSet<'static, T>>
     where
         T: RowValue,
     {
@@ -928,7 +863,7 @@ impl Connection {
     pub fn query_row(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row> {
         let mut stmt = self.statement(sql).fetch_array_size(1).build()?;
         stmt.query_row(params)?;
-        Ok(mem::replace(&mut stmt.stmt.row, None).unwrap())
+        Ok(stmt.stmt.row.take().unwrap())
     }
 
     /// Gets one row from a query using named bind parameters.
@@ -939,7 +874,7 @@ impl Connection {
     pub fn query_row_named(&self, sql: &str, params: &[(&str, &dyn ToSql)]) -> Result<Row> {
         let mut stmt = self.statement(sql).fetch_array_size(1).build()?;
         stmt.query_row_named(params)?;
-        Ok(mem::replace(&mut stmt.stmt.row, None).unwrap())
+        Ok(stmt.stmt.row.take().unwrap())
     }
 
     /// Gets one row from a query as specified type.
@@ -1101,7 +1036,7 @@ impl Connection {
                 });
             }
         }
-        let s = to_odpi_str(name);
+        let s = OdpiStr::new(name);
         let mut handle = ptr::null_mut();
         chkerr!(
             self.ctxt(),
@@ -1150,7 +1085,7 @@ impl Connection {
     /// # Ok::<(), Error>(())
     /// ```
     pub fn server_version(&self) -> Result<(Version, String)> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         let mut ver = MaybeUninit::uninit();
         chkerr!(
             self.ctxt(),
@@ -1169,9 +1104,9 @@ impl Connection {
         old_password: &str,
         new_password: &str,
     ) -> Result<()> {
-        let username = to_odpi_str(username);
-        let old_password = to_odpi_str(old_password);
-        let new_password = to_odpi_str(new_password);
+        let username = OdpiStr::new(username);
+        let old_password = OdpiStr::new(old_password);
+        let new_password = OdpiStr::new(new_password);
         chkerr!(
             self.ctxt(),
             dpiConn_changePassword(
@@ -1229,14 +1164,12 @@ impl Connection {
             Ok(status) => match status {
                 OCI_SERVER_NOT_CONNECTED => Ok(ConnStatus::NotConnected),
                 OCI_SERVER_NORMAL => Ok(ConnStatus::Normal),
-                _ => Err(Error::InternalError(format!(
-                    "Unexpected server status: {}",
+                _ => Err(Error::internal_error(format!(
+                    "unexpected server status {}",
                     status
                 ))),
             },
-            Err(Error::DpiError(err)) if err.message() == "DPI-1010: not connected" => {
-                Ok(ConnStatus::Closed)
-            }
+            Err(err) if err.dpi_code() == Some(DPI_ERR_NOT_CONNECTED) => Ok(ConnStatus::Closed),
             Err(err) => Err(err),
         }
     }
@@ -1291,7 +1224,7 @@ impl Connection {
     ///
     /// [Password Change Life Cycle]: https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-BED74427-BC63-4095-8829-1AF68411FC6B
     pub fn last_warning(&self) -> Option<Error> {
-        self.ctxt().last_warning().map(Error::OciError)
+        self.ctxt().last_warning().map(Error::oci_error)
     }
 
     /// Gets the statement cache size
@@ -1385,15 +1318,15 @@ impl Connection {
     /// ```
     pub fn set_call_timeout(&self, dur: Option<Duration>) -> Result<()> {
         if let Some(dur) = dur {
-            let msecs = duration_to_msecs(dur).ok_or_else(|| {
-                Error::OutOfRange(format!(
-                    "Too large duration {:?}. It must be less than 49.7 days",
+            let msecs = dur.as_millis().try_into().map_err(|_| {
+                Error::out_of_range(format!(
+                    "too long duration {:?}. It must be less than 49.7 days",
                     dur
                 ))
             })?;
             if msecs == 0 {
-                return Err(Error::OutOfRange(format!(
-                    "Too short duration {:?}. It must not be submilliseconds",
+                return Err(Error::out_of_range(format!(
+                    "too short duration {:?}. It must not be submilliseconds",
                     dur
                 )));
             }
@@ -1406,7 +1339,7 @@ impl Connection {
 
     /// Gets current schema associated with the connection
     pub fn current_schema(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiConn_getCurrentSchema(self.handle(), &mut s.ptr, &mut s.len)
@@ -1457,7 +1390,7 @@ impl Connection {
     /// # Ok::<(), Error>(())
     /// ```
     pub fn set_current_schema(&self, current_schema: &str) -> Result<()> {
-        let s = to_odpi_str(current_schema);
+        let s = OdpiStr::new(current_schema);
         chkerr!(
             self.ctxt(),
             dpiConn_setCurrentSchema(self.handle(), s.ptr, s.len)
@@ -1467,7 +1400,7 @@ impl Connection {
 
     /// Gets edition associated with the connection
     pub fn edition(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiConn_getEdition(self.handle(), &mut s.ptr, &mut s.len)
@@ -1477,7 +1410,7 @@ impl Connection {
 
     /// Gets external name associated with the connection
     pub fn external_name(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiConn_getExternalName(self.handle(), &mut s.ptr, &mut s.len)
@@ -1487,7 +1420,7 @@ impl Connection {
 
     /// Sets external name associated with the connection
     pub fn set_external_name(&self, external_name: &str) -> Result<()> {
-        let s = to_odpi_str(external_name);
+        let s = OdpiStr::new(external_name);
         chkerr!(
             self.ctxt(),
             dpiConn_setExternalName(self.handle(), s.ptr, s.len)
@@ -1497,7 +1430,7 @@ impl Connection {
 
     /// Gets internal name associated with the connection
     pub fn internal_name(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiConn_getInternalName(self.handle(), &mut s.ptr, &mut s.len)
@@ -1507,7 +1440,7 @@ impl Connection {
 
     /// Sets internal name associated with the connection
     pub fn set_internal_name(&self, internal_name: &str) -> Result<()> {
-        let s = to_odpi_str(internal_name);
+        let s = OdpiStr::new(internal_name);
         chkerr!(
             self.ctxt(),
             dpiConn_setInternalName(self.handle(), s.ptr, s.len)
@@ -1523,7 +1456,7 @@ impl Connection {
     ///
     /// [DBMS_APPLICATION_INFO.SET_MODULE]: https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-B2E2BD20-D91D-40DB-A3F6-37A853384F30
     pub fn set_module(&self, module: &str) -> Result<()> {
-        let s = to_odpi_str(module);
+        let s = OdpiStr::new(module);
         chkerr!(self.ctxt(), dpiConn_setModule(self.handle(), s.ptr, s.len));
         Ok(())
     }
@@ -1536,7 +1469,7 @@ impl Connection {
     ///
     /// [DBMS_APPLICATION_INFO.SET_ACTION]: https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-90DA860F-BFBE-4539-BA00-2279B02B8F26
     pub fn set_action(&self, action: &str) -> Result<()> {
-        let s = to_odpi_str(action);
+        let s = OdpiStr::new(action);
         chkerr!(self.ctxt(), dpiConn_setAction(self.handle(), s.ptr, s.len));
         Ok(())
     }
@@ -1549,7 +1482,7 @@ impl Connection {
     ///
     /// [DBMS_APPLICATION_INFO.SET_CLIENT_INFO]: https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-68A3DF04-BE91-46CC-8D2B-97BA0E89956F
     pub fn set_client_info(&self, client_info: &str) -> Result<()> {
-        let s = to_odpi_str(client_info);
+        let s = OdpiStr::new(client_info);
         chkerr!(
             self.ctxt(),
             dpiConn_setClientInfo(self.handle(), s.ptr, s.len)
@@ -1565,7 +1498,7 @@ impl Connection {
     ///
     /// [DBMS_SESSION.SET_IDENTIFIER]: https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-988EA930-BDFE-4205-A806-E54F05333562
     pub fn set_client_identifier(&self, client_identifier: &str) -> Result<()> {
-        let s = to_odpi_str(client_identifier);
+        let s = OdpiStr::new(client_identifier);
         chkerr!(
             self.ctxt(),
             dpiConn_setClientIdentifier(self.handle(), s.ptr, s.len)
@@ -1586,7 +1519,7 @@ impl Connection {
     /// [DBMS_SQL_MONITOR.BEGIN_OPERATION]: https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-25BE0E79-3A19-4303-9F66-2CFDB87C7F82
     /// [Monitoring Database Operations]: https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-C941CE9D-97E1-42F8-91ED-4949B2B710BF
     pub fn set_db_op(&self, db_op: &str) -> Result<()> {
-        let s = to_odpi_str(db_op);
+        let s = OdpiStr::new(db_op);
         chkerr!(self.ctxt(), dpiConn_setDbOp(self.handle(), s.ptr, s.len));
         Ok(())
     }

@@ -32,7 +32,7 @@ use chrono::Duration;
 
 fn fixed_offset_from_sql(ts: &Timestamp) -> Result<FixedOffset> {
     FixedOffset::east_opt(ts.tz_offset())
-        .ok_or_else(|| Error::OutOfRange(format!("invalid time zone offset: {}", ts.tz_offset())))
+        .ok_or_else(|| Error::out_of_range(format!("invalid time zone offset: {}", ts.tz_offset())))
 }
 
 //
@@ -48,7 +48,7 @@ where
     date_from_sql(tz, ts)?
         .and_hms_nano_opt(ts.hour(), ts.minute(), ts.second(), ts.nanosecond())
         .ok_or_else(|| {
-            Error::OutOfRange(format!(
+            Error::out_of_range(format!(
                 "invalid year-month-day: {}-{}-{} {}:{}:{}.{:09}",
                 ts.year(),
                 ts.month(),
@@ -108,8 +108,8 @@ where
             self.minute(),
             self.second(),
             self.nanosecond(),
-        );
-        let ts = ts.and_tz_offset(self.offset().fix().local_minus_utc());
+        )?;
+        let ts = ts.and_tz_offset(self.offset().fix().local_minus_utc())?;
         val.set_timestamp(&ts)
     }
 }
@@ -131,7 +131,7 @@ where
 {
     match tz.ymd_opt(ts.year(), ts.month(), ts.day()) {
         LocalResult::Single(date) => Ok(date),
-        _ => Err(Error::OutOfRange(format!(
+        _ => Err(Error::out_of_range(format!(
             "invalid month and/or day: {}-{}-{}",
             ts.year(),
             ts.month(),
@@ -184,8 +184,8 @@ where
     }
 
     fn to_sql(&self, val: &mut SqlValue) -> Result<()> {
-        let ts = Timestamp::new(self.year(), self.month(), self.day(), 0, 0, 0, 0);
-        let ts = ts.and_tz_offset(self.offset().fix().local_minus_utc());
+        let ts = Timestamp::new(self.year(), self.month(), self.day(), 0, 0, 0, 0)?;
+        let ts = ts.and_tz_offset(self.offset().fix().local_minus_utc())?;
         val.set_timestamp(&ts)
     }
 }
@@ -198,7 +198,7 @@ fn naive_date_time_from_sql(ts: &Timestamp) -> Result<NaiveDateTime> {
     naive_date_from_sql(ts)?
         .and_hms_nano_opt(ts.hour(), ts.minute(), ts.second(), ts.nanosecond())
         .ok_or_else(|| {
-            Error::OutOfRange(format!(
+            Error::out_of_range(format!(
                 "invalid year-month-day: {}-{}-{} {}:{}:{}.{:09}",
                 ts.year(),
                 ts.month(),
@@ -238,7 +238,7 @@ impl ToSql for NaiveDateTime {
             self.minute(),
             self.second(),
             self.nanosecond(),
-        );
+        )?;
         val.set_timestamp(&ts)
     }
 }
@@ -249,7 +249,7 @@ impl ToSql for NaiveDateTime {
 
 fn naive_date_from_sql(ts: &Timestamp) -> Result<NaiveDate> {
     NaiveDate::from_ymd_opt(ts.year(), ts.month(), ts.day()).ok_or_else(|| {
-        Error::OutOfRange(format!(
+        Error::out_of_range(format!(
             "invalid year-month-day: {}-{}-{}",
             ts.year(),
             ts.month(),
@@ -277,7 +277,7 @@ impl ToSql for NaiveDate {
     }
 
     fn to_sql(&self, val: &mut SqlValue) -> Result<()> {
-        let ts = Timestamp::new(self.year(), self.month(), self.day(), 0, 0, 0, 0);
+        let ts = Timestamp::new(self.year(), self.month(), self.day(), 0, 0, 0, 0)?;
         val.set_timestamp(&ts)
     }
 }
@@ -288,7 +288,12 @@ impl ToSql for NaiveDate {
 
 impl FromSql for Duration {
     fn from_sql(val: &SqlValue) -> Result<Duration> {
-        let err = |it: IntervalDS| Error::OutOfRange(format!("Duration overflow: {}", it));
+        let err = |it: IntervalDS| {
+            Error::out_of_range(format!(
+                "unable to convert interval day to second {} to chrono::Duration",
+                it
+            ))
+        };
         let it = val.to_interval_ds()?;
         let d = Duration::milliseconds(0);
         let d = d
@@ -331,7 +336,7 @@ impl ToSql for Duration {
         let minutes = secs / 60;
         let secs = secs % 60;
         if days.abs() >= 1000000000 {
-            return Err(Error::OutOfRange(format!("too large days: {}", self)));
+            return Err(Error::out_of_range(format!("too large days: {}", self)));
         }
         let it = IntervalDS::new(
             days as i32,
@@ -339,7 +344,7 @@ impl ToSql for Duration {
             minutes as i32,
             secs as i32,
             nsecs as i32,
-        );
+        )?;
         val.set_interval_ds(&it)
     }
 }

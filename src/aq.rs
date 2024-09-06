@@ -103,18 +103,18 @@
 use crate::binding::*;
 use crate::chkerr;
 use crate::connection::Conn;
-use crate::new_odpi_str;
 use crate::sql_type::Object;
 use crate::sql_type::ObjectType;
 use crate::sql_type::OracleType;
 use crate::sql_type::Timestamp;
-use crate::to_odpi_str;
 use crate::to_rust_slice;
 use crate::Connection;
 use crate::Context;
 use crate::DpiMsgProps;
+use crate::DpiObject;
 use crate::DpiQueue;
 use crate::Error;
+use crate::OdpiStr;
 use crate::Result;
 use std::borrow::ToOwned;
 use std::fmt;
@@ -172,13 +172,16 @@ impl Payload for Object {
     }
 
     fn get(props: &MsgProps<Self>) -> Result<Object> {
-        let objtype = props.payload_type.as_ref().ok_or(Error::NoDataFound)?;
-        let mut obj_handle = ptr::null_mut();
+        let objtype = props
+            .payload_type
+            .as_ref()
+            .ok_or_else(Error::no_data_found)?;
+        let mut obj_handle = DpiObject::null();
         chkerr!(
             props.ctxt(),
             dpiMsgProps_getPayload(
                 props.handle.raw,
-                &mut obj_handle,
+                &mut obj_handle.raw,
                 ptr::null_mut(),
                 ptr::null_mut()
             )
@@ -189,7 +192,7 @@ impl Payload for Object {
     fn set(&self, props: &mut MsgProps<Self>) -> Result<()> {
         chkerr!(
             props.ctxt(),
-            dpiMsgProps_setPayloadObject(props.handle.raw, self.handle)
+            dpiMsgProps_setPayloadObject(props.handle.raw, self.handle())
         );
         props.payload_type = Some(self.object_type().clone());
         Ok(())
@@ -211,7 +214,7 @@ where
     phantom: PhantomData<T>,
 }
 
-impl<'a, T: 'a> Queue<T>
+impl<T> Queue<T>
 where
     T: Payload + ?Sized,
 {
@@ -231,7 +234,7 @@ where
         payload_type: &T::TypeInfo,
     ) -> Result<Queue<T>> {
         let mut handle = ptr::null_mut();
-        let name = to_odpi_str(queue_name);
+        let name = OdpiStr::new(queue_name);
         let payload_type = T::payload_type(payload_type)?;
         let objtype = payload_type
             .as_ref()
@@ -312,7 +315,7 @@ where
     ///
     /// [`Queue.enqueue`]: #method.enqueue
     /// [`Queue.dequeue_many`]: #method.dequeue_many
-    pub fn enqueue_many<I>(&self, props: I) -> Result<()>
+    pub fn enqueue_many<'a, I>(&'a self, props: I) -> Result<()>
     where
         I: IntoIterator<Item = &'a MsgProps<T>>,
     {
@@ -395,7 +398,7 @@ impl MessageDeliveryMode {
             DPI_MODE_MSG_PERSISTENT => Ok(MessageDeliveryMode::Persistent),
             DPI_MODE_MSG_BUFFERED => Ok(MessageDeliveryMode::Buffered),
             DPI_MODE_MSG_PERSISTENT_OR_BUFFERED => Ok(MessageDeliveryMode::PersistentOrBuffered),
-            _ => Err(Error::InternalError(format!(
+            _ => Err(Error::internal_error(format!(
                 "unknown dpiMessageDeliveryMode {}",
                 val
             ))),
@@ -435,7 +438,7 @@ impl MessageState {
             DPI_MSG_STATE_WAITING => Ok(MessageState::Waiting),
             DPI_MSG_STATE_PROCESSED => Ok(MessageState::Processed),
             DPI_MSG_STATE_EXPIRED => Ok(MessageState::Expired),
-            _ => Err(Error::InternalError(format!(
+            _ => Err(Error::internal_error(format!(
                 "unknown dpiMessageState {}",
                 val
             ))),
@@ -472,7 +475,7 @@ impl DeqMode {
             DPI_MODE_DEQ_LOCKED => Ok(DeqMode::Locked),
             DPI_MODE_DEQ_REMOVE => Ok(DeqMode::Remove),
             DPI_MODE_DEQ_REMOVE_NO_DATA => Ok(DeqMode::RemoveNoData),
-            _ => Err(Error::InternalError(format!("unknown dpiDeqMode {}", val))),
+            _ => Err(Error::internal_error(format!("unknown dpiDeqMode {}", val))),
         }
     }
 
@@ -512,7 +515,7 @@ impl DeqNavigation {
             DPI_DEQ_NAV_FIRST_MSG => Ok(DeqNavigation::FirstMessage),
             DPI_DEQ_NAV_NEXT_TRANSACTION => Ok(DeqNavigation::NextTransaction),
             DPI_DEQ_NAV_NEXT_MSG => Ok(DeqNavigation::NextMessage),
-            _ => Err(Error::InternalError(format!(
+            _ => Err(Error::internal_error(format!(
                 "unknown dpiDeqNavigation {}",
                 val
             ))),
@@ -546,7 +549,7 @@ impl Visibility {
         match val {
             DPI_VISIBILITY_IMMEDIATE => Ok(Visibility::Immediate),
             DPI_VISIBILITY_ON_COMMIT => Ok(Visibility::OnCommit),
-            _ => Err(Error::InternalError(format!(
+            _ => Err(Error::internal_error(format!(
                 "unknown dpiVisibility {}",
                 val
             ))),
@@ -583,7 +586,7 @@ impl DeqOptions {
     ///
     /// See [`set_condition`](#method.set_condition) method for more information
     pub fn condition(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_getCondition(self.handle, &mut s.ptr, &mut s.len)
@@ -595,7 +598,7 @@ impl DeqOptions {
     ///
     /// see [`set_consumer_name`](#method.set_consumer_name) method for more information.
     pub fn consumer_name(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_getConsumerName(self.handle, &mut s.ptr, &mut s.len)
@@ -607,7 +610,7 @@ impl DeqOptions {
     ///
     ///  See [`set_correlation`](#method.set_correlation) method for more information.
     pub fn correlation(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_getCorrelation(self.handle, &mut s.ptr, &mut s.len)
@@ -624,7 +627,7 @@ impl DeqOptions {
 
     /// Returns the identifier of the specific message that is to be dequeued.
     pub fn message_id(&self) -> Result<Vec<u8>> {
-        let mut msg = new_odpi_str();
+        let mut msg = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_getMsgId(self.handle, &mut msg.ptr, &mut msg.len)
@@ -646,7 +649,7 @@ impl DeqOptions {
     ///
     /// See [`set_transformation`](#method.set_transformation) method for more information.
     pub fn transformation(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_getTransformation(self.handle, &mut s.ptr, &mut s.len)
@@ -681,7 +684,7 @@ impl DeqOptions {
     /// properties must be prefixed with tab.user_data as a qualifier to indicate
     /// the specific column of the queue table that stores the message payload.
     pub fn set_condition(&mut self, val: &str) -> Result<()> {
-        let val = to_odpi_str(val);
+        let val = OdpiStr::new(val);
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_setCondition(self.handle, val.ptr, val.len)
@@ -692,7 +695,7 @@ impl DeqOptions {
     /// Sets the name of the consumer which will be dequeuing messages. This value
     /// should only be set if the queue is set up for multiple consumers.
     pub fn set_consumer_name(&mut self, val: &str) -> Result<()> {
-        let val = to_odpi_str(val);
+        let val = OdpiStr::new(val);
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_setConsumerName(self.handle, val.ptr, val.len)
@@ -707,7 +710,7 @@ impl DeqOptions {
     /// can be used. If multiple messages satisfy the pattern, the order of
     /// dequeuing is undetermined.
     pub fn set_correlation(&mut self, val: &str) -> Result<()> {
-        let val = to_odpi_str(val);
+        let val = OdpiStr::new(val);
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_setCorrelation(self.handle, val.ptr, val.len)
@@ -760,7 +763,7 @@ impl DeqOptions {
     /// is applied after the message is dequeued but before it is returned to the
     /// application. It must be created using DBMS_TRANSFORM.
     pub fn set_transformation(&mut self, val: &str) -> Result<()> {
-        let val = to_odpi_str(val);
+        let val = OdpiStr::new(val);
         chkerr!(
             self.ctxt(),
             dpiDeqOptions_setTransformation(self.handle, val.ptr, val.len)
@@ -781,12 +784,7 @@ impl DeqOptions {
     /// Set the time to wait for a message matching the search
     /// criteria.
     pub fn set_wait(&mut self, val: &Duration) -> Result<()> {
-        let secs = val.as_secs();
-        let secs = if secs > u32::max_value().into() {
-            u32::max_value()
-        } else {
-            secs as u32
-        };
+        let secs = val.as_secs().try_into().unwrap_or(u32::MAX);
         chkerr!(self.ctxt(), dpiDeqOptions_setWait(self.handle, secs));
         Ok(())
     }
@@ -819,7 +817,7 @@ impl EnqOptions {
     ///
     /// See [`set_transformation`](#method.set_transformation) method for more information.
     pub fn transformation(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiEnqOptions_getTransformation(self.handle, &mut s.ptr, &mut s.len)
@@ -853,7 +851,7 @@ impl EnqOptions {
     /// is applied after the message is enqueued but before it is returned to the
     /// application. It must be created using DBMS_TRANSFORM.
     pub fn set_transformation(&mut self, val: &str) -> Result<()> {
-        let val = to_odpi_str(val);
+        let val = OdpiStr::new(val);
         chkerr!(
             self.ctxt(),
             dpiEnqOptions_setTransformation(self.handle, val.ptr, val.len)
@@ -942,7 +940,7 @@ where
     /// Returns the correlation supplied by the producer when the message was
     /// enqueued.
     pub fn correlation(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiMsgProps_getCorrelation(self.handle(), &mut s.ptr, &mut s.len)
@@ -979,7 +977,7 @@ where
     ///
     /// See [`set_exception_queue`](#method.set_exception_queue) method for more information.
     pub fn exception_queue(&self) -> Result<String> {
-        let mut s = new_odpi_str();
+        let mut s = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiMsgProps_getExceptionQ(self.handle(), &mut s.ptr, &mut s.len)
@@ -1002,7 +1000,7 @@ where
     /// Returns the id of the message in the queue that generated this message. No
     /// value is available until the message has been enqueued or dequeued.
     pub fn message_id(&self) -> Result<Vec<u8>> {
-        let mut msg = new_odpi_str();
+        let mut msg = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiMsgProps_getMsgId(self.handle(), &mut msg.ptr, &mut msg.len)
@@ -1015,7 +1013,7 @@ where
     ///
     /// See [`set_original_message_id`](#method.set_original_message_id) for more information.
     pub fn original_message_id(&self) -> Result<Vec<u8>> {
-        let mut msg = new_odpi_str();
+        let mut msg = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiMsgProps_getOriginalMsgId(self.handle(), &mut msg.ptr, &mut msg.len)
@@ -1060,7 +1058,7 @@ where
     /// messages satisfy the pattern, the order of dequeuing is
     /// undetermined.
     pub fn set_correlation(&mut self, val: &str) -> Result<()> {
-        let val = to_odpi_str(val);
+        let val = OdpiStr::new(val);
         chkerr!(
             self.ctxt(),
             dpiMsgProps_setCorrelation(self.handle(), val.ptr, val.len)
@@ -1079,16 +1077,12 @@ where
     /// [`MessageState::Waiting`]: MessageState#variant.Waiting
     /// [`MessageState::Ready`]: MessageState#variant.Ready
     pub fn set_delay(&mut self, val: &Duration) -> Result<()> {
-        let secs = val.as_secs();
-        if secs > i32::max_value() as u64 {
-            Err(Error::OutOfRange(format!("too long duration {:?}", val)))
-        } else {
-            chkerr!(
-                self.ctxt(),
-                dpiMsgProps_setDelay(self.handle(), secs as i32)
-            );
-            Ok(())
-        }
+        let secs = val
+            .as_secs()
+            .try_into()
+            .map_err(|_| Error::out_of_range(format!("too long duration {:?}", val)))?;
+        chkerr!(self.ctxt(), dpiMsgProps_setDelay(self.handle(), secs));
+        Ok(())
     }
 
     /// Sets the name of the queue to which the message is moved if it cannot be
@@ -1101,7 +1095,7 @@ where
     ///
     /// [`MessageState::Expired`]: MessageState#variant.Expired
     pub fn set_exception_queue(&mut self, val: &str) -> Result<()> {
-        let val = to_odpi_str(val);
+        let val = OdpiStr::new(val);
         chkerr!(
             self.ctxt(),
             dpiMsgProps_setExceptionQ(self.handle(), val.ptr, val.len)
@@ -1119,16 +1113,12 @@ where
     /// [`MessageState::Ready`]: MessageState#variant.Ready
     /// [`MessageState::Expired`]: MessageState#variant.Expired
     pub fn set_expiration(&mut self, val: &Duration) -> Result<()> {
-        let secs = val.as_secs();
-        if secs > i32::max_value() as u64 {
-            Err(Error::OutOfRange(format!("too long duration {:?}", val)))
-        } else {
-            chkerr!(
-                self.ctxt(),
-                dpiMsgProps_setExpiration(self.handle(), secs as i32)
-            );
-            Ok(())
-        }
+        let secs = val
+            .as_secs()
+            .try_into()
+            .map_err(|_| Error::out_of_range(format!("too long duration {:?}", val)))?;
+        chkerr!(self.ctxt(), dpiMsgProps_setExpiration(self.handle(), secs));
+        Ok(())
     }
 
     /// Sets the id of the message in the last queue that generated this

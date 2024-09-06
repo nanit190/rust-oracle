@@ -15,14 +15,13 @@
 use crate::binding::*;
 use crate::chkerr;
 use crate::io::SeekInChars;
-use crate::new_odpi_str;
 use crate::sql_type::FromSql;
 use crate::sql_type::OracleType;
 use crate::sql_type::ToSql;
 use crate::sql_type::ToSqlNull;
-use crate::to_odpi_str;
 use crate::Connection;
 use crate::Context;
+use crate::OdpiStr;
 use crate::Result;
 use crate::SqlValue;
 use std::cmp;
@@ -283,8 +282,8 @@ impl LobLocator {
     }
 
     fn directory_and_file_name(&self) -> Result<(String, String)> {
-        let mut dir_alias = new_odpi_str();
-        let mut file_name = new_odpi_str();
+        let mut dir_alias = OdpiStr::new("");
+        let mut file_name = OdpiStr::new("");
         chkerr!(
             self.ctxt(),
             dpiLob_getDirectoryAndFileName(
@@ -299,8 +298,8 @@ impl LobLocator {
     }
 
     fn set_directory_and_file_name(&self, directory_alias: &str, file_name: &str) -> Result<()> {
-        let dir_alias = to_odpi_str(directory_alias);
-        let file_name = to_odpi_str(file_name);
+        let dir_alias = OdpiStr::new(directory_alias);
+        let file_name = OdpiStr::new(file_name);
         chkerr!(
             self.ctxt(),
             dpiLob_setDirectoryAndFileName(
@@ -751,7 +750,7 @@ impl_traits!(FromSql, ToSqlNull, ToSql, Read, Write, SeekInChars, Lob for Nclob 
 mod tests {
     use super::*;
     use crate::test_util;
-    use lazy_static::lazy_static;
+    use once_cell::sync::Lazy;
     use std::io::Read;
     use std::io::Seek;
     use std::io::Write;
@@ -795,15 +794,13 @@ mod tests {
         }
     }
 
-    lazy_static! {
-        static ref TEST_DATA: String = {
-            Rand::new()
-                .take(100)
-                .map(|n| CRAB_CHARS[(n as usize) % CRAB_CHARS.len()])
-                .collect::<Vec<_>>()
-                .join("")
-        };
-    }
+    static TEST_DATA: Lazy<String> = Lazy::new(|| {
+        Rand::new()
+            .take(100)
+            .map(|n| CRAB_CHARS[(n as usize) % CRAB_CHARS.len()])
+            .collect::<Vec<_>>()
+            .join("")
+    });
 
     #[test]
     fn read_write_blob() -> std::result::Result<(), std::boxed::Box<dyn std::error::Error>> {
@@ -857,7 +854,10 @@ mod tests {
 
         // error when querying blob as Blob without `StatementBuilder.lob_locator()`.
         let mut stmt = conn.statement(sql).build()?;
-        assert_eq!(stmt.query_row_as::<Blob>(&[]).unwrap_err().to_string(), "invalid operation: Please use StatementBuilder.lob_locator() to fetch LOB data as Blob");
+        assert_eq!(
+            stmt.query_row_as::<Blob>(&[]).unwrap_err().to_string(),
+            "use StatementBuilder.lob_locator() instead to fetch LOB data as Blob"
+        );
         Ok(())
     }
 

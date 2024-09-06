@@ -13,15 +13,20 @@
 // (ii) the Apache License v 2.0. (http://www.apache.org/licenses/LICENSE-2.0)
 //-----------------------------------------------------------------------------
 
+use crate::sql_type::OracleType;
+use crate::Error;
+use crate::ErrorKind;
+use crate::ParseOracleTypeError;
+use crate::Result;
+use std::ffi::CString;
 use std::fmt;
 use std::result;
 use std::str;
-use std::time::Duration;
 
-use crate::sql_type::OracleType;
-use crate::Error;
-use crate::ParseOracleTypeError;
-use crate::Result;
+#[cfg_attr(unix, path = "util/unix.rs")]
+#[cfg_attr(windows, path = "util/windows.rs")]
+pub mod os;
+pub use os::*; // import all os-depend functions.
 
 pub struct Scanner<'a> {
     chars: str::Chars<'a>,
@@ -29,8 +34,8 @@ pub struct Scanner<'a> {
     ndigits: u32,
 }
 
-impl<'a> Scanner<'a> {
-    pub fn new(s: &'a str) -> Scanner<'a> {
+impl Scanner<'_> {
+    pub fn new(s: &str) -> Scanner {
         let mut chars = s.chars();
         let char = chars.next();
         Scanner {
@@ -165,8 +170,8 @@ pub fn write_literal(
     s: &Result<String>,
     oratype: &OracleType,
 ) -> fmt::Result {
-    match *s {
-        Ok(ref s) => match *oratype {
+    match s {
+        Ok(s) => match *oratype {
             OracleType::Varchar2(_)
             | OracleType::NVarchar2(_)
             | OracleType::Char(_)
@@ -190,21 +195,15 @@ pub fn write_literal(
             }
             _ => write!(f, "{}", s),
         },
-        Err(Error::NullValue) => write!(f, "NULL"),
-        Err(ref err) => write!(f, "ERR({})", err),
+        Err(err) if err.kind() == ErrorKind::NullValue => write!(f, "NULL"),
+        Err(err) => write!(f, "ERR({})", err),
     }
 }
 
-pub fn duration_to_msecs(dur: Duration) -> Option<u32> {
-    let msecs = dur
-        .as_secs()
-        .checked_mul(1000)?
-        .checked_add(dur.subsec_nanos() as u64 / 1_000_000)?;
-    if msecs <= u32::max_value() as u64 {
-        Some(msecs as u32)
-    } else {
-        None
-    }
+pub fn string_into_c_string(s: String, name: &str) -> Result<CString> {
+    CString::new(s).map_err(|err| {
+        Error::invalid_argument(format!("{} cannot contain nul characters", name)).add_source(err)
+    })
 }
 
 #[cfg(test)]
@@ -268,21 +267,5 @@ mod tests {
             parse_str_into_raw("9AABBCCDDEEFF0"),
             Ok(vec![0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef, 0xf0])
         );
-    }
-
-    #[test]
-    fn test_duration_to_msecs() {
-        assert_eq!(duration_to_msecs(Duration::new(0, 0)), Some(0));
-        assert_eq!(duration_to_msecs(Duration::from_nanos(999_999)), Some(0));
-        assert_eq!(duration_to_msecs(Duration::from_nanos(1_000_000)), Some(1));
-        assert_eq!(
-            duration_to_msecs(Duration::from_millis(u32::max_value() as u64)),
-            Some(u32::max_value())
-        );
-        assert_eq!(
-            duration_to_msecs(Duration::from_millis(u32::max_value() as u64 + 1)),
-            None
-        );
-        assert_eq!(duration_to_msecs(Duration::new(50 * 24 * 60 * 60, 0)), None);
     }
 }

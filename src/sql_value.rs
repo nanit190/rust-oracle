@@ -20,6 +20,7 @@ use std::ptr;
 use std::rc::Rc;
 use std::str;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use crate::binding::*;
 use crate::chkerr;
@@ -46,20 +47,22 @@ use crate::to_rust_str;
 use crate::util::check_number_format;
 use crate::util::parse_str_into_raw;
 use crate::util::set_hex_string;
-use crate::Connection;
+use crate::AssertSend;
 use crate::Context;
+use crate::DpiObject;
+use crate::DpiStmt;
+use crate::DpiVar;
 use crate::Error;
+use crate::ErrorKind;
 use crate::Result;
 
 macro_rules! flt_to_int {
     ($expr:expr, $src_type:ident, $dest_type:ident) => {{
         let src_val = $expr;
-        if $dest_type::min_value() as $src_type <= src_val
-            && src_val <= $dest_type::max_value() as $src_type
-        {
+        if $dest_type::MIN as $src_type <= src_val && src_val <= $dest_type::MAX as $src_type {
             Ok(src_val as $dest_type)
         } else {
-            Err(Error::OutOfRange(format!(
+            Err(Error::out_of_range(format!(
                 "{} overflow: {}",
                 stringify!($dest_type),
                 src_val.to_string(),
@@ -118,9 +121,17 @@ macro_rules! define_fn_set_int {
 }
 
 pub enum BufferRowIndex {
-    Shared(Rc<AtomicU32>),
+    Shared(Arc<AtomicU32>),
     Owned(u32),
 }
+
+enum DpiData<'a> {
+    Data(&'a mut dpiData),
+    Var(Rc<DpiVar>), // Rc is incremented only when <Row as RowValue>::get() is called.
+    Null,
+}
+
+unsafe impl Send for DpiData<'_> {}
 
 /// A type containing an Oracle value
 ///
@@ -129,67 +140,89 @@ pub enum BufferRowIndex {
 ///
 /// When this is a bind value in a SQL statement, the Oracle type is determined
 /// by [`ToSql::oratype`].
-pub struct SqlValue {
+pub struct SqlValue<'a> {
     conn: Conn,
-    pub(crate) handle: *mut dpiVar,
-    data: *mut dpiData,
+    data: DpiData<'a>,
     native_type: NativeType,
     oratype: Option<OracleType>,
     pub(crate) array_size: u32,
     pub(crate) buffer_row_index: BufferRowIndex,
     keep_bytes: Vec<u8>,
-    keep_dpiobj: *mut dpiObject,
+    keep_dpiobj: DpiObject,
     pub(crate) lob_bind_type: LobBindType,
     pub(crate) query_params: QueryParams,
 }
 
-impl SqlValue {
+impl SqlValue<'_> {
     fn new(
         conn: Conn,
         lob_bind_type: LobBindType,
         query_params: QueryParams,
         array_size: u32,
-    ) -> SqlValue {
+    ) -> SqlValue<'static> {
         SqlValue {
             conn,
-            handle: ptr::null_mut(),
-            data: ptr::null_mut(),
+            data: DpiData::Null,
             native_type: NativeType::Int64,
             oratype: None,
             array_size,
             buffer_row_index: BufferRowIndex::Owned(0),
             keep_bytes: Vec::new(),
-            keep_dpiobj: ptr::null_mut(),
+            keep_dpiobj: DpiObject::null(),
             lob_bind_type,
             query_params,
         }
     }
 
-    pub(crate) fn for_bind(conn: Conn, query_params: QueryParams, array_size: u32) -> SqlValue {
+    pub(crate) fn for_bind(
+        conn: Conn,
+        query_params: QueryParams,
+        array_size: u32,
+    ) -> SqlValue<'static> {
         SqlValue::new(conn, LobBindType::Locator, query_params, array_size)
     }
 
-    pub(crate) fn for_column(conn: Conn, query_params: QueryParams, array_size: u32) -> SqlValue {
-        SqlValue::new(conn, query_params.lob_bind_type, query_params, array_size)
+    pub(crate) fn for_column(
+        conn: Conn,
+        query_params: QueryParams,
+        shared_buffer_row_index: Arc<AtomicU32>,
+        oratype: &OracleType,
+        stmt_handle: *mut dpiStmt,
+        pos: u32,
+    ) -> Result<SqlValue<'static>> {
+        let array_size = query_params.fetch_array_size;
+        let mut val = SqlValue::new(conn, query_params.lob_bind_type, query_params, array_size);
+        let oratype_i64 = OracleType::Int64;
+        let oratype = match oratype {
+            // When the column type is number whose prec is less than 18
+            // and the scale is zero, define it as int64.
+            OracleType::Number(prec, 0) if 0 < *prec && *prec < DPI_MAX_INT64_PRECISION as u8 => {
+                &oratype_i64
+            }
+            _ => oratype,
+        };
+        val.buffer_row_index = BufferRowIndex::Shared(shared_buffer_row_index);
+        val.init_handle(oratype)?;
+        chkerr!(val.ctxt(), dpiStmt_define(stmt_handle, pos, val.handle()?));
+        Ok(val)
     }
 
     // for object type
-    pub(crate) fn from_oratype(
+    pub(crate) fn from_oratype<'a>(
         conn: Conn,
         oratype: &OracleType,
-        data: &mut dpiData,
-    ) -> Result<SqlValue> {
+        data: &'a mut dpiData,
+    ) -> Result<SqlValue<'a>> {
         let (_, native_type, _, _) = oratype.var_create_param()?;
         Ok(SqlValue {
             conn,
-            handle: ptr::null_mut(),
-            data: data as *mut dpiData,
+            data: DpiData::Data(data),
             native_type,
             oratype: Some(oratype.clone()),
             array_size: 0,
             buffer_row_index: BufferRowIndex::Owned(0),
             keep_bytes: Vec::new(),
-            keep_dpiobj: ptr::null_mut(),
+            keep_dpiobj: DpiObject::null(),
             lob_bind_type: LobBindType::Locator,
             query_params: QueryParams::new(),
         })
@@ -200,9 +233,10 @@ impl SqlValue {
     }
 
     fn handle_is_reusable(&self, oratype: &OracleType) -> Result<bool> {
-        if self.handle.is_null() {
-            return Ok(false);
-        }
+        match self.data {
+            DpiData::Var(_) => (),
+            _ => return Ok(false),
+        };
         let current_oratype = match self.oratype {
             Some(ref oratype) => oratype,
             None => return Ok(false),
@@ -228,12 +262,7 @@ impl SqlValue {
         if self.handle_is_reusable(oratype)? {
             return Ok(false);
         }
-        if !self.handle.is_null() {
-            unsafe { dpiVar_release(self.handle) };
-        }
-        self.handle = ptr::null_mut();
-        let mut handle: *mut dpiVar = ptr::null_mut();
-        let mut data: *mut dpiData = ptr::null_mut();
+        self.data = DpiData::Null;
         let (oratype_num, native_type, size, size_is_byte) = match self.lob_bind_type {
             LobBindType::Bytes => match oratype {
                 OracleType::CLOB => &OracleType::Long,
@@ -249,6 +278,8 @@ impl SqlValue {
             LobBindType::Locator => oratype,
         }
         .var_create_param()?;
+        let mut handle = ptr::null_mut();
+        let mut data = ptr::null_mut();
         let native_type_num = native_type.to_native_type_num();
         let object_type_handle = native_type.to_object_type_handle();
         chkerr!(
@@ -263,11 +294,10 @@ impl SqlValue {
                 0,
                 object_type_handle,
                 &mut handle,
-                &mut data
+                &mut data,
             )
         );
-        self.handle = handle;
-        self.data = data;
+        self.data = DpiData::Var(Rc::new(DpiVar::new(handle, data)));
         self.native_type = native_type;
         self.oratype = Some(oratype.clone());
         if native_type_num == DPI_NATIVE_TYPE_STMT {
@@ -282,15 +312,16 @@ impl SqlValue {
     }
 
     pub(crate) fn fix_internal_data(&mut self) -> Result<()> {
+        let handle = self.handle()?;
         let mut num = 0;
         let mut data = ptr::null_mut();
         chkerr!(
             self.ctxt(),
-            dpiVar_getReturnedData(self.handle, 0, &mut num, &mut data)
+            dpiVar_getReturnedData(handle, 0, &mut num, &mut data)
         );
         if num != 0 {
             self.array_size = num;
-            self.data = data;
+            self.data = DpiData::Var(Rc::new(DpiVar::with_add_ref(handle, data)));
         }
         Ok(())
     }
@@ -302,8 +333,25 @@ impl SqlValue {
         }
     }
 
-    fn data(&self) -> *mut dpiData {
-        unsafe { self.data.offset(self.buffer_row_index() as isize) }
+    pub(crate) fn handle(&self) -> Result<*mut dpiVar> {
+        if let DpiData::Var(var) = &self.data {
+            Ok(var.raw)
+        } else {
+            Err(Error::internal_error("dpVar handle isn't initialized"))
+        }
+    }
+
+    pub(crate) fn data(&self) -> Result<&mut dpiData> {
+        unsafe {
+            Ok(&mut *match self.data {
+                DpiData::Data(ref data) => *data as *const dpiData as *mut dpiData,
+                DpiData::Var(ref var) => var.data,
+                DpiData::Null => {
+                    return Err(Error::internal_error("dpData isn't initialized"));
+                }
+            }
+            .offset(self.buffer_row_index() as isize))
+        }
     }
 
     pub(crate) fn native_type_num(&self) -> dpiNativeTypeNum {
@@ -345,38 +393,32 @@ impl SqlValue {
     }
 
     fn invalid_conversion_to_rust_type<T>(&self, to_type: &str) -> Result<T> {
-        match self.oratype {
-            Some(ref oratype) => Err(Error::InvalidTypeConversion(
-                oratype.to_string(),
-                to_type.to_string(),
-            )),
-            None => Err(Error::UninitializedBindValue),
-        }
+        Err(match self.oratype {
+            Some(ref oratype) => Error::invalid_type_conversion(oratype.to_string(), to_type),
+            None => Error::uninitialized_bind_value(),
+        })
     }
 
     fn invalid_conversion_from_rust_type<T>(&self, from_type: &str) -> Result<T> {
-        match self.oratype {
-            Some(ref oratype) => Err(Error::InvalidTypeConversion(
-                from_type.to_string(),
-                oratype.to_string(),
-            )),
-            None => Err(Error::UninitializedBindValue),
-        }
+        Err(match self.oratype {
+            Some(ref oratype) => Error::invalid_type_conversion(from_type, oratype.to_string()),
+            None => Error::uninitialized_bind_value(),
+        })
     }
 
     fn lob_locator_is_not_set<T>(&self, to_type: &str) -> Result<T> {
         match self.oratype {
-            Some(_) => Err(Error::InvalidOperation(format!(
-                "Please use StatementBuilder.lob_locator() to fetch LOB data as {}",
+            Some(_) => Err(Error::invalid_operation(format!(
+                "use StatementBuilder.lob_locator() instead to fetch LOB data as {}",
                 to_type
             ))),
-            None => Err(Error::UninitializedBindValue),
+            None => Err(Error::uninitialized_bind_value()),
         }
     }
 
     fn check_not_null(&self) -> Result<()> {
         if self.is_null()? {
-            Err(Error::NullValue)
+            Err(Error::null_value())
         } else {
             Ok(())
         }
@@ -384,14 +426,12 @@ impl SqlValue {
 
     /// Returns `Ok(true)` when the SQL value is null. `Ok(false)` when it isn't null.
     pub fn is_null(&self) -> Result<bool> {
-        unsafe { Ok((*self.data()).isNull != 0) }
+        Ok(self.data()?.isNull != 0)
     }
 
     /// Sets null to the SQL value.
     pub fn set_null(&mut self) -> Result<()> {
-        unsafe {
-            (*self.data()).isNull = 1;
-        }
+        self.data()?.isNull = 1;
         Ok(())
     }
 
@@ -399,7 +439,7 @@ impl SqlValue {
     pub fn oracle_type(&self) -> Result<&OracleType> {
         match self.oratype {
             Some(ref oratype) => Ok(oratype),
-            None => Err(Error::UninitializedBindValue),
+            None => Err(Error::uninitialized_bind_value()),
         }
     }
 
@@ -419,28 +459,28 @@ impl SqlValue {
     /// NativeType::Int64. Otherwise, this returns unexpected value.
     fn get_i64_unchecked(&self) -> Result<i64> {
         self.check_not_null()?;
-        unsafe { Ok(dpiData_getInt64(self.data())) }
+        unsafe { Ok(dpiData_getInt64(self.data()?)) }
     }
 
     /// Gets the SQL value as u64. The native_type must be
     /// NativeType::UInt64. Otherwise, this returns unexpected value.
     fn get_u64_unchecked(&self) -> Result<u64> {
         self.check_not_null()?;
-        unsafe { Ok(dpiData_getUint64(self.data())) }
+        unsafe { Ok(dpiData_getUint64(self.data()?)) }
     }
 
     /// Gets the SQL value as f32. The native_type must be
     /// NativeType::Float. Otherwise, this returns unexpected value.
     fn get_f32_unchecked(&self) -> Result<f32> {
         self.check_not_null()?;
-        unsafe { Ok(dpiData_getFloat(self.data())) }
+        unsafe { Ok(dpiData_getFloat(self.data()?)) }
     }
 
     /// Gets the SQL value as f64. The native_type must be
     /// NativeType::Double. Otherwise, this returns unexpected value.
     fn get_f64_unchecked(&self) -> Result<f64> {
         self.check_not_null()?;
-        unsafe { Ok(dpiData_getDouble(self.data())) }
+        unsafe { Ok(dpiData_getDouble(self.data()?)) }
     }
 
     /// Gets the SQL value as utf8 string. The native_type must be
@@ -449,7 +489,7 @@ impl SqlValue {
     fn get_string_unchecked(&self) -> Result<String> {
         self.check_not_null()?;
         unsafe {
-            let bytes = dpiData_getBytes(self.data());
+            let bytes = dpiData_getBytes(self.data()?);
             Ok(to_rust_str((*bytes).ptr, (*bytes).length))
         }
     }
@@ -459,7 +499,7 @@ impl SqlValue {
     fn get_raw_unchecked(&self) -> Result<Vec<u8>> {
         self.check_not_null()?;
         unsafe {
-            let bytes = dpiData_getBytes(self.data());
+            let bytes = dpiData_getBytes(self.data()?);
             let mut vec = Vec::with_capacity((*bytes).length as usize);
             vec.extend_from_slice(to_rust_slice((*bytes).ptr, (*bytes).length));
             Ok(vec)
@@ -471,7 +511,7 @@ impl SqlValue {
     fn get_raw_as_hex_string_unchecked(&self) -> Result<String> {
         self.check_not_null()?;
         unsafe {
-            let bytes = dpiData_getBytes(self.data());
+            let bytes = dpiData_getBytes(self.data()?);
             let mut str = String::with_capacity(((*bytes).length * 2) as usize);
             set_hex_string(&mut str, to_rust_slice((*bytes).ptr, (*bytes).length));
             Ok(str)
@@ -483,7 +523,7 @@ impl SqlValue {
     fn get_timestamp_unchecked(&self) -> Result<Timestamp> {
         self.check_not_null()?;
         unsafe {
-            let ts = dpiData_getTimestamp(self.data());
+            let ts = dpiData_getTimestamp(self.data()?);
             Ok(Timestamp::from_dpi_timestamp(&*ts, self.oracle_type()?))
         }
     }
@@ -493,8 +533,8 @@ impl SqlValue {
     fn get_interval_ds_unchecked(&self) -> Result<IntervalDS> {
         self.check_not_null()?;
         unsafe {
-            let it = dpiData_getIntervalDS(self.data());
-            Ok(IntervalDS::from_dpi_interval_ds(&*it, self.oracle_type()?))
+            let it = dpiData_getIntervalDS(self.data()?);
+            IntervalDS::from_dpi_interval_ds(&*it, self.oracle_type()?)
         }
     }
 
@@ -503,15 +543,15 @@ impl SqlValue {
     fn get_interval_ym_unchecked(&self) -> Result<IntervalYM> {
         self.check_not_null()?;
         unsafe {
-            let it = dpiData_getIntervalYM(self.data());
-            Ok(IntervalYM::from_dpi_interval_ym(&*it, self.oracle_type()?))
+            let it = dpiData_getIntervalYM(self.data()?);
+            IntervalYM::from_dpi_interval_ym(&*it, self.oracle_type()?)
         }
     }
 
     fn get_clob_as_string_unchecked(&self) -> Result<String> {
         self.check_not_null()?;
         const READ_CHAR_SIZE: u64 = 8192;
-        let lob = unsafe { dpiData_getLOB(self.data()) };
+        let lob = unsafe { dpiData_getLOB(self.data()?) };
         let mut total_char_size = 0;
         let mut total_byte_size = 0;
         let mut bufsiz = 0;
@@ -539,7 +579,7 @@ impl SqlValue {
 
     fn get_blob_unchecked(&self) -> Result<Vec<u8>> {
         self.check_not_null()?;
-        let lob = unsafe { dpiData_getLOB(self.data()) };
+        let lob = unsafe { dpiData_getLOB(self.data()?) };
         let mut total_size = 0;
         unsafe {
             dpiLob_getSize(lob, &mut total_size);
@@ -565,7 +605,7 @@ impl SqlValue {
     fn get_blob_as_hex_string_unchecked(&self) -> Result<String> {
         self.check_not_null()?;
         const READ_SIZE: u64 = 8192;
-        let lob = unsafe { dpiData_getLOB(self.data()) };
+        let lob = unsafe { dpiData_getLOB(self.data()?) };
         let mut total_size = 0;
         unsafe {
             dpiLob_getSize(lob, &mut total_size);
@@ -589,23 +629,31 @@ impl SqlValue {
 
     fn get_collection_unchecked(&self, objtype: &ObjectType) -> Result<Collection> {
         self.check_not_null()?;
-        let dpiobj = unsafe { dpiData_getObject(self.data()) };
+        let dpiobj = unsafe { dpiData_getObject(self.data()?) };
         chkerr!(self.ctxt(), dpiObject_addRef(dpiobj));
-        Ok(Collection::new(self.conn.clone(), dpiobj, objtype.clone()))
+        Ok(Collection::new(
+            self.conn.clone(),
+            DpiObject::new(dpiobj),
+            objtype.clone(),
+        ))
     }
 
     fn get_object_unchecked(&self, objtype: &ObjectType) -> Result<Object> {
         self.check_not_null()?;
-        let dpiobj = unsafe { dpiData_getObject(self.data()) };
+        let dpiobj = unsafe { dpiData_getObject(self.data()?) };
         chkerr!(self.ctxt(), dpiObject_addRef(dpiobj));
-        Ok(Object::new(self.conn.clone(), dpiobj, objtype.clone()))
+        Ok(Object::new(
+            self.conn.clone(),
+            DpiObject::new(dpiobj),
+            objtype.clone(),
+        ))
     }
 
     /// Gets the SQL value as bool. The native_type must be
     /// NativeType::Boolean. Otherwise, this returns unexpected value.
     fn get_bool_unchecked(&self) -> Result<bool> {
         self.check_not_null()?;
-        unsafe { Ok(dpiData_getBool(self.data()) != 0) }
+        unsafe { Ok(dpiData_getBool(self.data()?) != 0) }
     }
 
     fn get_rowid_as_string_unchecked(&self) -> Result<String> {
@@ -614,19 +662,19 @@ impl SqlValue {
         let mut len = 0;
         chkerr!(
             self.ctxt(),
-            dpiRowid_getStringValue((*self.data()).value.asRowid, &mut ptr, &mut len)
+            dpiRowid_getStringValue(self.data()?.value.asRowid, &mut ptr, &mut len)
         );
         Ok(to_rust_str(ptr, len))
     }
 
     fn get_lob_unchecked(&self) -> Result<*mut dpiLob> {
         self.check_not_null()?;
-        unsafe { Ok(dpiData_getLOB(self.data())) }
+        unsafe { Ok(dpiData_getLOB(self.data()?)) }
     }
 
     fn get_stmt_unchecked(&self) -> Result<*mut dpiStmt> {
         self.check_not_null()?;
-        unsafe { Ok(dpiData_getStmt(self.data())) }
+        unsafe { Ok(dpiData_getStmt(self.data()?)) }
     }
 
     //
@@ -636,54 +684,59 @@ impl SqlValue {
     /// Sets i64 to the SQL value. The native_type must be
     /// NativeType::Int64. Otherwise, this may cause access violation.
     fn set_i64_unchecked(&mut self, val: i64) -> Result<()> {
-        unsafe { dpiData_setInt64(self.data(), val) }
+        unsafe { dpiData_setInt64(self.data()?, val) }
         Ok(())
     }
 
     /// Sets u64 to the SQL value. The native_type must be
     /// NativeType::UInt64. Otherwise, this may cause access violation.
     fn set_u64_unchecked(&mut self, val: u64) -> Result<()> {
-        unsafe { dpiData_setUint64(self.data(), val) }
+        unsafe { dpiData_setUint64(self.data()?, val) }
         Ok(())
     }
 
     /// Sets f32 to the SQL value. The native_type must be
     /// NativeType::Float. Otherwise, this may cause access violation.
     fn set_f32_unchecked(&mut self, val: f32) -> Result<()> {
-        unsafe { dpiData_setFloat(self.data(), val) }
+        unsafe { dpiData_setFloat(self.data()?, val) }
         Ok(())
     }
 
     /// Sets f64 to the SQL value. The native_type must be
     /// NativeType::Double. Otherwise, this may cause access violation.
     fn set_f64_unchecked(&mut self, val: f64) -> Result<()> {
-        unsafe { dpiData_setDouble(self.data(), val) }
+        unsafe { dpiData_setDouble(self.data()?, val) }
         Ok(())
     }
 
     fn set_bytes_unchecked(&mut self, val: &[u8]) -> Result<()> {
-        if self.handle.is_null() {
-            self.keep_bytes = Vec::with_capacity(val.len());
-            self.keep_bytes.extend_from_slice(val);
-            unsafe {
-                dpiData_setBytes(
-                    self.data(),
-                    self.keep_bytes.as_mut_ptr() as *mut c_char,
-                    val.len() as u32,
-                );
+        match &self.data {
+            DpiData::Data(_) => {
+                self.keep_bytes = Vec::with_capacity(val.len());
+                self.keep_bytes.extend_from_slice(val);
+                unsafe {
+                    dpiData_setBytes(
+                        self.data()?,
+                        self.keep_bytes.as_mut_ptr() as *mut c_char,
+                        val.len() as u32,
+                    );
+                }
+                Ok(())
             }
-        } else {
-            chkerr!(
-                self.ctxt(),
-                dpiVar_setFromBytes(
-                    self.handle,
-                    self.buffer_row_index(),
-                    val.as_ptr() as *const c_char,
-                    val.len() as u32
-                )
-            );
+            DpiData::Var(var) => {
+                chkerr!(
+                    self.ctxt(),
+                    dpiVar_setFromBytes(
+                        var.raw,
+                        self.buffer_row_index(),
+                        val.as_ptr() as *const c_char,
+                        val.len() as u32
+                    )
+                );
+                Ok(())
+            }
+            DpiData::Null => Err(Error::internal_error("dpiData isn't initialized")),
         }
-        Ok(())
     }
 
     /// Sets utf8 string to the SQL value. The native_type must be
@@ -704,7 +757,7 @@ impl SqlValue {
     fn set_timestamp_unchecked(&mut self, val: &Timestamp) -> Result<()> {
         unsafe {
             dpiData_setTimestamp(
-                self.data(),
+                self.data()?,
                 val.year() as i16,
                 val.month() as u8,
                 val.day() as u8,
@@ -724,7 +777,7 @@ impl SqlValue {
     fn set_interval_ds_unchecked(&mut self, val: &IntervalDS) -> Result<()> {
         unsafe {
             dpiData_setIntervalDS(
-                self.data(),
+                self.data()?,
                 val.days(),
                 val.hours(),
                 val.minutes(),
@@ -738,91 +791,88 @@ impl SqlValue {
     /// Sets IntervalYM to the SQL value. The native_type must be
     /// NativeType::IntervalYM. Otherwise, this may cause access violation.
     fn set_interval_ym_unchecked(&mut self, val: &IntervalYM) -> Result<()> {
-        unsafe { dpiData_setIntervalYM(self.data(), val.years(), val.months()) }
+        unsafe { dpiData_setIntervalYM(self.data()?, val.years(), val.months()) }
         Ok(())
     }
 
     fn set_string_to_clob_unchecked(&mut self, val: &str) -> Result<()> {
         let ptr = val.as_ptr() as *const c_char;
         let len = val.len() as u64;
-        let lob = unsafe { dpiData_getLOB(self.data()) };
+        let lob = unsafe { dpiData_getLOB(self.data()?) };
         chkerr!(self.ctxt(), dpiLob_trim(lob, 0));
         chkerr!(self.ctxt(), dpiLob_writeBytes(lob, 1, ptr, len));
-        unsafe {
-            (*self.data()).isNull = 0;
-        }
+        self.data()?.isNull = 0;
         Ok(())
     }
 
     fn set_raw_to_blob_unchecked(&mut self, val: &[u8]) -> Result<()> {
         let ptr = val.as_ptr() as *const c_char;
         let len = val.len() as u64;
-        let lob = unsafe { dpiData_getLOB(self.data()) };
+        let lob = unsafe { dpiData_getLOB(self.data()?) };
         chkerr!(self.ctxt(), dpiLob_trim(lob, 0));
         chkerr!(self.ctxt(), dpiLob_writeBytes(lob, 1, ptr, len));
-        unsafe {
-            (*self.data()).isNull = 0;
-        }
+        self.data()?.isNull = 0;
         Ok(())
     }
 
-    fn set_object_unchecked(&mut self, obj: *mut dpiObject) -> Result<()> {
-        if self.handle.is_null() {
-            if !self.keep_dpiobj.is_null() {
-                unsafe { dpiObject_release(self.keep_dpiobj) };
+    fn set_object_unchecked(&mut self, obj: &DpiObject) -> Result<()> {
+        match self.data {
+            DpiData::Data(_) => {
+                unsafe { dpiData_setObject(self.data()?, obj.raw) }
+                self.keep_dpiobj = obj.clone();
+                Ok(())
             }
-            unsafe {
-                dpiObject_addRef(obj);
-                dpiData_setObject(self.data(), obj)
+            DpiData::Var(ref var) => {
+                chkerr!(
+                    self.ctxt(),
+                    dpiVar_setFromObject(var.raw, self.buffer_row_index(), obj.raw)
+                );
+                Ok(())
             }
-            self.keep_dpiobj = obj;
-        } else {
-            chkerr!(
-                self.ctxt(),
-                dpiVar_setFromObject(self.handle, self.buffer_row_index(), obj)
-            );
+            DpiData::Null => Err(Error::internal_error("dpiData isn't initialized")),
         }
-        Ok(())
     }
 
     /// Sets bool to the SQL value. The native_type must be
     /// NativeType::Boolean. Otherwise, this may cause access violation.
     fn set_bool_unchecked(&mut self, val: bool) -> Result<()> {
-        unsafe { dpiData_setBool(self.data(), i32::from(val)) }
+        unsafe { dpiData_setBool(self.data()?, i32::from(val)) }
         Ok(())
     }
 
     fn set_lob_unchecked(&mut self, lob: *mut dpiLob) -> Result<()> {
         chkerr!(
             self.ctxt(),
-            dpiVar_setFromLob(self.handle, self.buffer_row_index(), lob)
+            dpiVar_setFromLob(self.handle()?, self.buffer_row_index(), lob)
         );
         Ok(())
     }
 
-    /// Returns a duplicated value of self.
-    pub fn dup(&self, _conn: &Connection) -> Result<SqlValue> {
-        self.dup_by_handle()
+    pub(crate) fn clone_except_fetch_array_buffer(&self) -> Result<SqlValue<'static>> {
+        if let DpiData::Var(ref var) = self.data {
+            Ok(SqlValue {
+                conn: self.conn.clone(),
+                data: DpiData::Var(var.clone()),
+                native_type: self.native_type.clone(),
+                oratype: self.oratype.clone(),
+                array_size: self.array_size,
+                buffer_row_index: BufferRowIndex::Owned(self.buffer_row_index()),
+                keep_bytes: Vec::new(),
+                keep_dpiobj: DpiObject::null(),
+                lob_bind_type: self.lob_bind_type,
+                query_params: self.query_params.clone(),
+            })
+        } else {
+            Err(Error::internal_error("dpVar handle isn't initialized"))
+        }
     }
 
-    pub(crate) fn dup_by_handle(&self) -> Result<SqlValue> {
-        let mut val = SqlValue::new(
-            self.conn.clone(),
-            self.lob_bind_type,
-            self.query_params.clone(),
-            1,
-        );
-        if let Some(ref oratype) = self.oratype {
-            val.init_handle(oratype)?;
-            chkerr!(
-                self.ctxt(),
-                dpiVar_copyData(val.handle, 0, self.handle, self.buffer_row_index()),
-                unsafe {
-                    dpiVar_release(val.handle);
-                }
-            );
+    pub(crate) fn fetch_array_buffer_shared_count(&self) -> Result<usize> {
+        if let DpiData::Var(ref var) = self.data {
+            Ok(Rc::strong_count(var))
+        } else {
+            Err(Error::internal_error("dpData isn't initialized"))
         }
-        Ok(val)
     }
 
     //
@@ -1075,9 +1125,9 @@ impl SqlValue {
 
     pub(crate) fn to_ref_cursor(&self) -> Result<RefCursor> {
         match self.native_type {
-            NativeType::Stmt => Ok(RefCursor::from_raw(
+            NativeType::Stmt => Ok(RefCursor::from_handle(
                 self.conn.clone(),
-                self.get_stmt_unchecked()?,
+                DpiStmt::with_add_ref(self.get_stmt_unchecked()?),
                 self.query_params.clone(),
             )?),
             _ => self.invalid_conversion_to_rust_type("RefCursor"),
@@ -1198,7 +1248,7 @@ impl SqlValue {
     /// Sets Object to the Sql Value
     pub(crate) fn set_object(&mut self, val: &Object) -> Result<()> {
         match self.native_type {
-            NativeType::Object(_) => self.set_object_unchecked(val.handle),
+            NativeType::Object(_) => self.set_object_unchecked(&val.handle),
             _ => self.invalid_conversion_from_rust_type("Object"),
         }
     }
@@ -1206,7 +1256,7 @@ impl SqlValue {
     /// Sets Collection to the Sql Value
     pub(crate) fn set_collection(&mut self, val: &Collection) -> Result<()> {
         match self.native_type {
-            NativeType::Object(_) => self.set_object_unchecked(val.handle),
+            NativeType::Object(_) => self.set_object_unchecked(&val.handle),
             _ => self.invalid_conversion_from_rust_type("Collection"),
         }
     }
@@ -1264,26 +1314,25 @@ impl SqlValue {
         self.invalid_conversion_from_rust_type("Nclob")
     }
 
-    /// The cloned value must not live longer than self.
-    /// Otherwise it may cause access violation.
-    pub(crate) fn unsafely_clone(&self) -> SqlValue {
-        SqlValue {
+    pub(crate) fn clone_with_narrow_lifetime(&self) -> Result<SqlValue> {
+        Ok(SqlValue {
             conn: self.conn.clone(),
-            handle: ptr::null_mut(),
-            data: self.data,
+            data: DpiData::Data(self.data()?),
             native_type: self.native_type.clone(),
             oratype: self.oratype.clone(),
             array_size: self.array_size,
             buffer_row_index: BufferRowIndex::Owned(0),
             keep_bytes: Vec::new(),
-            keep_dpiobj: ptr::null_mut(),
+            keep_dpiobj: DpiObject::null(),
             lob_bind_type: self.lob_bind_type,
             query_params: self.query_params.clone(),
-        }
+        })
     }
 }
 
-impl fmt::Display for SqlValue {
+impl AssertSend for SqlValue<'_> {}
+
+impl fmt::Display for SqlValue<'_> {
     /// Formats any SQL value to string using the given formatter.
     /// Note that both a null value and a string `NULL` are formatted
     /// as `NULL`.
@@ -1291,7 +1340,7 @@ impl fmt::Display for SqlValue {
         if self.oratype.is_some() {
             match self.to_string() {
                 Ok(s) => write!(f, "{}", s),
-                Err(Error::NullValue) => write!(f, "NULL"),
+                Err(err) if err.kind() == ErrorKind::NullValue => write!(f, "NULL"),
                 Err(err) => write!(f, "{}", err),
             }
         } else {
@@ -1300,7 +1349,7 @@ impl fmt::Display for SqlValue {
     }
 }
 
-impl fmt::Debug for SqlValue {
+impl fmt::Debug for SqlValue<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(ref oratype) = self.oratype {
             write!(f, "SqlValue {{ val: ")?;
@@ -1311,7 +1360,7 @@ impl fmt::Debug for SqlValue {
                     }
                     _ => write!(f, "{}", s),
                 },
-                Err(Error::NullValue) => write!(f, "NULL"),
+                Err(err) if err.kind() == ErrorKind::NullValue => write!(f, "NULL"),
                 Err(err) => write!(f, "{}", err),
             }?;
             write!(
@@ -1323,17 +1372,6 @@ impl fmt::Debug for SqlValue {
             )
         } else {
             write!(f, "SqlValue {{ uninitialized }}")
-        }
-    }
-}
-
-impl Drop for SqlValue {
-    fn drop(&mut self) {
-        if !self.handle.is_null() {
-            unsafe { dpiVar_release(self.handle) };
-        }
-        if !self.keep_dpiobj.is_null() {
-            unsafe { dpiObject_release(self.keep_dpiobj) };
         }
     }
 }

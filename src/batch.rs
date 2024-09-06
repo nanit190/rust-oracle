@@ -32,16 +32,17 @@
 
 use crate::binding::*;
 use crate::chkerr;
-use crate::error::dberror_from_dpi_error;
+use crate::error::DPI_ERR_BUFFER_SIZE_TOO_SMALL;
 use crate::private;
 use crate::sql_type::OracleType;
 use crate::sql_type::ToSql;
 use crate::sql_value::BufferRowIndex;
 use crate::statement::QueryParams;
-use crate::to_odpi_str;
 use crate::to_rust_str;
 use crate::Connection;
+use crate::DbError;
 use crate::Error;
+use crate::OdpiStr;
 use crate::Result;
 use crate::SqlValue;
 #[cfg(doc)]
@@ -140,22 +141,23 @@ impl<'conn, 'sql> BatchBuilder<'conn, 'sql> {
     }
 
     /// See ["Error Handling"](Batch#error-handling)
-    pub fn with_batch_errors<'a>(&'a mut self) -> &'a mut BatchBuilder<'conn, 'sql> {
+    pub fn with_batch_errors(&mut self) -> &mut BatchBuilder<'conn, 'sql> {
         self.with_batch_errors = true;
         self
     }
 
     /// See ["Affected Rows"](Batch#affected-rows)
-    pub fn with_row_counts<'a>(&'a mut self) -> &'a mut BatchBuilder<'conn, 'sql> {
+    pub fn with_row_counts(&mut self) -> &mut BatchBuilder<'conn, 'sql> {
         self.with_row_counts = true;
         self
     }
 
     pub fn build(&self) -> Result<Batch<'conn>> {
-        let batch_size = u32::try_from(self.batch_size)
-            .map_err(|_| Error::OutOfRange(format!("too large batch_size: {}", self.batch_size)))?;
+        let batch_size = u32::try_from(self.batch_size).map_err(|err| {
+            Error::out_of_range(format!("too large batch size {}", self.batch_size)).add_source(err)
+        })?;
         let conn = self.conn;
-        let sql = to_odpi_str(self.sql);
+        let sql = OdpiStr::new(self.sql);
         let mut handle: *mut dpiStmt = ptr::null_mut();
         chkerr!(
             conn.ctxt(),
@@ -183,10 +185,10 @@ impl<'conn, 'sql> BatchBuilder<'conn, 'sql> {
                 dpiStmt_release(handle);
             }
             let msg = format!(
-                "Could not use {} statement",
+                "could not use {} statement",
                 StatementType::from_enum(info.statementType)
             );
-            return Err(Error::InvalidOperation(msg));
+            return Err(Error::invalid_operation(msg));
         };
         let mut num = 0;
         chkerr!(
@@ -437,7 +439,7 @@ pub struct Batch<'conn> {
     statement_type: StatementType,
     bind_count: usize,
     bind_names: Vec<String>,
-    bind_values: Vec<SqlValue>,
+    bind_values: Vec<SqlValue<'conn>>,
     bind_types: Vec<Option<BindType>>,
     batch_index: u32,
     batch_size: u32,
@@ -450,7 +452,6 @@ impl<'conn> Batch<'conn> {
     /// Closes the batch before the end of its lifetime.
     pub fn close(&mut self) -> Result<()> {
         chkerr!(self.conn.ctxt(), dpiStmt_close(self.handle, ptr::null(), 0));
-        self.handle = ptr::null_mut();
         Ok(())
     }
 
@@ -529,8 +530,8 @@ impl<'conn> Batch<'conn> {
                     dpiStmt_getBatchErrors(self.handle, errnum, errs.as_mut_ptr())
                 );
                 unsafe { errs.set_len(errnum as usize) };
-                return Err(Error::BatchErrors(
-                    errs.iter().map(dberror_from_dpi_error).collect(),
+                return Err(Error::make_batch_errors(
+                    errs.iter().map(DbError::from_dpi_error).collect(),
                 ));
             }
         }
@@ -573,8 +574,8 @@ impl<'conn> Batch<'conn> {
         if self.batch_index < self.batch_size {
             Ok(())
         } else {
-            Err(Error::OutOfRange(format!(
-                "Over the max batch size {}",
+            Err(Error::out_of_range(format!(
+                "over the max batch size {}",
                 self.batch_size
             )))
         }
@@ -600,15 +601,15 @@ impl<'conn> Batch<'conn> {
     {
         let pos = bindidx.idx(self)?;
         if self.bind_types[pos].is_some() {
-            return Err(Error::InvalidOperation(format!(
-                "The bind parameter type at {} has been specified already.",
+            return Err(Error::invalid_operation(format!(
+                "type at {} has set already",
                 bindidx
             )));
         }
         self.bind_values[pos].init_handle(oratype)?;
         chkerr!(
             self.conn.ctxt(),
-            bindidx.bind(self.handle, self.bind_values[pos].handle)
+            bindidx.bind(self.handle, self.bind_values[pos].handle()?)
         );
         self.bind_types[pos] = Some(BindType::new(oratype));
         Ok(())
@@ -658,18 +659,18 @@ impl<'conn> Batch<'conn> {
             self.bind_values[pos].init_handle(bind_type.as_oratype().unwrap_or(&oratype))?;
             chkerr!(
                 self.conn.ctxt(),
-                bindidx.bind(self.handle, self.bind_values[pos].handle)
+                bindidx.bind(self.handle, self.bind_values[pos].handle()?)
             );
             self.bind_types[pos] = Some(bind_type);
         }
         match self.bind_values[pos].set(value) {
-            Err(Error::DpiError(dberr)) if dberr.message().starts_with("DPI-1019:") => {
+            Err(err) if err.dpi_code() == Some(DPI_ERR_BUFFER_SIZE_TOO_SMALL) => {
                 let bind_type = self.bind_types[pos].as_mut().unwrap();
                 if bind_type.as_oratype().is_none() {
-                    return Err(Error::DpiError(dberr));
+                    return Err(err);
                 }
                 let new_oratype = value.oratype(self.conn)?;
-                let new_size = oratype_size(&new_oratype).ok_or(Error::DpiError(dberr))?;
+                let new_size = oratype_size(&new_oratype).ok_or(err)?;
                 bind_type.reset_size(new_size);
                 // allocate new bind handle.
                 let mut new_sql_value = SqlValue::for_bind(
@@ -683,9 +684,9 @@ impl<'conn> Batch<'conn> {
                     chkerr!(
                         self.conn.ctxt(),
                         dpiVar_copyData(
-                            new_sql_value.handle,
+                            new_sql_value.handle()?,
                             idx,
-                            self.bind_values[pos].handle,
+                            self.bind_values[pos].handle()?,
                             idx
                         )
                     );
@@ -694,7 +695,7 @@ impl<'conn> Batch<'conn> {
                 new_sql_value.set(value)?;
                 chkerr!(
                     self.conn.ctxt(),
-                    bindidx.bind(self.handle, new_sql_value.handle)
+                    bindidx.bind(self.handle, new_sql_value.handle()?)
                 );
                 self.bind_values[pos] = new_sql_value;
                 Ok(())
@@ -773,7 +774,7 @@ impl BatchBindIndex for usize {
         if 0 < num && *self <= num {
             Ok(*self - 1)
         } else {
-            Err(Error::InvalidBindIndex(*self))
+            Err(Error::invalid_bind_index(*self))
         }
     }
 
@@ -783,7 +784,7 @@ impl BatchBindIndex for usize {
     }
 }
 
-impl<'a> BatchBindIndex for &'a str {
+impl BatchBindIndex for &str {
     #[doc(hidden)]
     fn idx(&self, batch: &Batch) -> Result<usize> {
         let bindname = self.to_uppercase();
@@ -791,12 +792,12 @@ impl<'a> BatchBindIndex for &'a str {
             .bind_names()
             .iter()
             .position(|&name| name == bindname)
-            .ok_or_else(|| Error::InvalidBindName((*self).to_string()))
+            .ok_or_else(|| Error::invalid_bind_name(*self))
     }
 
     #[doc(hidden)]
     unsafe fn bind(&self, stmt_handle: *mut dpiStmt, var_handle: *mut dpiVar) -> i32 {
-        let s = to_odpi_str(self);
+        let s = OdpiStr::new(self);
         dpiStmt_bindByName(stmt_handle, s.ptr, s.len, var_handle)
     }
 }
@@ -805,6 +806,7 @@ impl<'a> BatchBindIndex for &'a str {
 mod tests {
     use super::*;
     use crate::test_util;
+    use crate::ErrorKind;
 
     #[derive(Debug)]
     struct TestData {
@@ -911,14 +913,13 @@ mod tests {
             .build()
             .unwrap();
         match append_rows_then_execute(&mut batch, &rows) {
-            Err(Error::OciError(dberr)) => {
+            Err(err) if err.kind() == ErrorKind::OciError => {
                 let errcode = TEST_DATA
                     .iter()
                     .find(|data| data.error_code.is_some())
                     .unwrap()
-                    .error_code
-                    .unwrap();
-                assert_eq!(dberr.code(), errcode);
+                    .error_code;
+                assert_eq!(err.oci_code(), errcode);
             }
             x => {
                 panic!("got {:?}", x);
@@ -941,14 +942,16 @@ mod tests {
             .build()
             .unwrap();
         match append_rows_then_execute(&mut batch, &rows) {
-            Err(Error::BatchErrors(errs)) => {
+            Err(err) if err.batch_errors().is_some() => {
                 let expected_errors: Vec<(u32, i32)> = TEST_DATA
                     .iter()
                     .enumerate()
                     .filter(|row| row.1.error_code.is_some())
                     .map(|row| (row.0 as u32, row.1.error_code.unwrap()))
                     .collect();
-                let actual_errors: Vec<(u32, i32)> = errs
+                let actual_errors: Vec<(u32, i32)> = err
+                    .batch_errors()
+                    .unwrap()
                     .iter()
                     .map(|dberr| (dberr.offset(), dberr.code()))
                     .collect();

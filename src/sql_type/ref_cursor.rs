@@ -22,6 +22,7 @@ use crate::sql_type::ToSqlNull;
 use crate::statement::QueryParams;
 use crate::statement::Stmt;
 use crate::Connection;
+use crate::DpiStmt;
 use crate::Error;
 use crate::Result;
 use crate::ResultSet;
@@ -112,21 +113,20 @@ pub struct RefCursor {
 }
 
 impl RefCursor {
-    pub(crate) fn from_raw(
+    pub(crate) fn from_handle(
         conn: Conn,
-        handle: *mut dpiStmt,
+        handle: DpiStmt,
         query_params: QueryParams,
     ) -> Result<RefCursor> {
         chkerr!(
             conn.ctxt(),
-            dpiStmt_setFetchArraySize(handle, query_params.fetch_array_size)
+            dpiStmt_setFetchArraySize(handle.raw, query_params.fetch_array_size)
         );
         let mut num_query_columns = 0;
         chkerr!(
             conn.ctxt(),
-            dpiStmt_getNumQueryColumns(handle, &mut num_query_columns)
+            dpiStmt_getNumQueryColumns(handle.raw, &mut num_query_columns)
         );
-        chkerr!(conn.ctxt(), dpiStmt_addRef(handle));
         let mut stmt = Stmt::new(conn, handle, query_params, "".into());
         stmt.init_row(num_query_columns as usize)?;
         Ok(RefCursor { stmt })
@@ -162,7 +162,7 @@ impl RefCursor {
     /// # Ok::<(), Error>(())
     /// ```
     pub fn query(&mut self) -> Result<ResultSet<Row>> {
-        Ok(ResultSet::<Row>::new(&self.stmt))
+        Ok(ResultSet::<Row>::new(&mut self.stmt))
     }
 
     /// Gets rows as an itertor of the specified type.
@@ -196,7 +196,7 @@ impl RefCursor {
     where
         T: RowValue,
     {
-        Ok(ResultSet::<T>::new(&self.stmt))
+        Ok(ResultSet::<T>::new(&mut self.stmt))
     }
 
     /// Gets one row as [`Row`].
@@ -222,7 +222,7 @@ impl RefCursor {
     /// # Ok::<(), Error>(())
     /// ```
     pub fn query_row(&mut self) -> Result<Row> {
-        self.query()?.next().unwrap_or(Err(Error::NoDataFound))
+        self.query()?.next().unwrap_or(Err(Error::no_data_found()))
     }
 
     /// Gets one row as the specified type.
@@ -250,7 +250,9 @@ impl RefCursor {
     where
         T: RowValue,
     {
-        self.query_as()?.next().unwrap_or(Err(Error::NoDataFound))
+        self.query_as()?
+            .next()
+            .unwrap_or(Err(Error::no_data_found()))
     }
 }
 
@@ -266,8 +268,8 @@ impl ToSql for RefCursor {
     }
 
     fn to_sql(&self, _val: &mut SqlValue) -> Result<()> {
-        Err(Error::InvalidOperation(
-            "Cannot bind RefCursor as an IN parameter".into(),
+        Err(Error::invalid_operation(
+            "cannot bind RefCursor as an IN parameter",
         ))
     }
 }

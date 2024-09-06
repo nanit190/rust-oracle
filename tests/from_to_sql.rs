@@ -16,7 +16,7 @@
 mod common;
 
 use oracle::sql_type::{IntervalDS, IntervalYM, OracleType, Timestamp};
-use oracle::{Error, Result};
+use oracle::{ErrorKind, Result};
 
 macro_rules! chk_num_from {
     ($conn:ident, $val_from:expr, $val_to:expr, $(($T:ident, $success:tt)),+) => {
@@ -35,9 +35,8 @@ macro_rules! chk_num_from {
     };
     ($row:ident, $val:expr, $T:ident, false) => {
         let err = $row.get_as::<$T>().unwrap_err();
-        match err {
-            Error::ParseError(_) => (),
-            _ => panic!("Unexpected error: {}", err),
+        if err.kind() != ErrorKind::ParseError {
+            panic!("Unexpected error: {}", err);
         }
     };
 }
@@ -167,6 +166,15 @@ fn string_from_sql() -> Result<()> {
         let val: String = stmt.bind_value(1)?;
         assert_eq!(val, "FALSE".to_string());
     }
+
+    // Get XMLTYPE
+    let xmldata = "<data>ABCDEFGHIJKLMNOP</data>\n";
+    conn.execute("insert into TestXML values (1, :1)", &[&xmldata])?;
+    assert_eq!(
+        &conn.query_row_as::<String>("select XMLCol from TestXML where IntCol = 1", &[])?,
+        xmldata,
+    );
+    conn.rollback()?;
     Ok(())
 }
 
@@ -479,10 +487,10 @@ fn raw_from_to_sql() -> Result<()> {
 #[test]
 fn timestamp_from_sql() -> Result<()> {
     let conn = common::connect()?;
-    let ts = Timestamp::new(2012, 3, 4, 0, 0, 0, 0);
+    let ts = Timestamp::new(2012, 3, 4, 0, 0, 0, 0)?;
 
     test_from_sql!(&conn, "DATE '2012-03-04'", &OracleType::Date, &ts);
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0)?;
     test_from_sql!(
         &conn,
         "TO_DATE('2012-03-04 05:06:07', 'YYYY-MM-DD HH24:MI:SS')",
@@ -496,21 +504,21 @@ fn timestamp_from_sql() -> Result<()> {
         &OracleType::Timestamp(0),
         &ts
     );
-    let ts = ts.and_prec(1);
+    let ts = ts.and_prec(1)?;
     test_from_sql!(
         &conn,
         "CAST(TO_DATE('2012-03-04 05:06:07', 'YYYY-MM-DD HH24:MI:SS') AS TIMESTAMP(1))",
         &OracleType::Timestamp(1),
         &ts
     );
-    let ts = ts.and_prec(6);
+    let ts = ts.and_prec(6)?;
     test_from_sql!(
         &conn,
         "CAST(TO_DATE('2012-03-04 05:06:07', 'YYYY-MM-DD HH24:MI:SS') AS TIMESTAMP)",
         &OracleType::Timestamp(6),
         &ts
     );
-    let ts = ts.and_prec(9);
+    let ts = ts.and_prec(9)?;
     test_from_sql!(
         &conn,
         "CAST(TO_DATE('2012-03-04 05:06:07', 'YYYY-MM-DD HH24:MI:SS') AS TIMESTAMP(9))",
@@ -523,21 +531,21 @@ fn timestamp_from_sql() -> Result<()> {
         &OracleType::Timestamp(9),
         &ts
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123456789);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123456789)?;
     test_from_sql!(
         &conn,
         "TO_TIMESTAMP('2012-03-04 05:06:07.123456789', 'YYYY-MM-DD HH24:MI:SS.FF')",
         &OracleType::Timestamp(9),
         &ts
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123456000);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123456000)?;
     test_from_sql!(
         &conn,
         "TO_TIMESTAMP('2012-03-04 05:06:07.123456', 'YYYY-MM-DD HH24:MI:SS.FF')",
         &OracleType::Timestamp(9),
         &ts
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123000000);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123000000)?;
     test_from_sql!(
         &conn,
         "TO_TIMESTAMP('2012-03-04 05:06:07.123', 'YYYY-MM-DD HH24:MI:SS.FF')",
@@ -545,21 +553,21 @@ fn timestamp_from_sql() -> Result<()> {
         &ts
     );
 
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0).and_tz_offset(0);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0)?.and_tz_offset(0)?;
     test_from_sql!(
         &conn,
         "TO_TIMESTAMP_TZ('2012-03-04 05:06:07 +00:00', 'YYYY-MM-DD HH24:MI:SS TZH:TZM')",
         &OracleType::TimestampTZ(9),
         &ts
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0).and_tz_hm_offset(8, 45);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0)?.and_tz_hm_offset(8, 45)?;
     test_from_sql!(
         &conn,
         "TO_TIMESTAMP_TZ('2012-03-04 05:06:07 +08:45', 'YYYY-MM-DD HH24:MI:SS TZH:TZM')",
         &OracleType::TimestampTZ(9),
         &ts
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0).and_tz_hm_offset(-8, -45);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0)?.and_tz_hm_offset(-8, -45)?;
     test_from_sql!(
         &conn,
         "TO_TIMESTAMP_TZ('2012-03-04 05:06:07 -08:45', 'YYYY-MM-DD HH24:MI:SS TZH:TZM')",
@@ -572,7 +580,7 @@ fn timestamp_from_sql() -> Result<()> {
 #[test]
 fn timestamp_to_sql() -> Result<()> {
     let conn = common::connect()?;
-    let ts = Timestamp::new(2012, 3, 4, 0, 0, 0, 0);
+    let ts = Timestamp::new(2012, 3, 4, 0, 0, 0, 0)?;
 
     test_to_sql!(
         &conn,
@@ -581,7 +589,7 @@ fn timestamp_to_sql() -> Result<()> {
         "2012-03-04 00:00:00"
     );
 
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0)?;
     test_to_sql!(
         &conn,
         &ts,
@@ -595,21 +603,21 @@ fn timestamp_to_sql() -> Result<()> {
         "TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS')",
         "2012-03-04 05:06:07"
     );
-    let ts = ts.and_prec(1);
+    let ts = ts.and_prec(1)?;
     test_to_sql!(
         &conn,
         &ts,
         "TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS')",
         "2012-03-04 05:06:07"
     );
-    let ts = ts.and_prec(6);
+    let ts = ts.and_prec(6)?;
     test_to_sql!(
         &conn,
         &ts,
         "TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS')",
         "2012-03-04 05:06:07"
     );
-    let ts = ts.and_prec(9);
+    let ts = ts.and_prec(9)?;
     test_to_sql!(
         &conn,
         &ts,
@@ -622,21 +630,21 @@ fn timestamp_to_sql() -> Result<()> {
         "TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS')",
         "2012-03-04 05:06:07"
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123456789);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123456789)?;
     test_to_sql!(
         &conn,
         &ts,
         "TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS.FF')",
         "2012-03-04 05:06:07.123456789"
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123456000);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123456000)?;
     test_to_sql!(
         &conn,
         &ts,
         "TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS.FF6')",
         "2012-03-04 05:06:07.123456"
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123000000);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 123000000)?;
     test_to_sql!(
         &conn,
         &ts,
@@ -644,21 +652,21 @@ fn timestamp_to_sql() -> Result<()> {
         "2012-03-04 05:06:07.123"
     );
 
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0).and_tz_offset(0);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0)?.and_tz_offset(0)?;
     test_to_sql!(
         &conn,
         &ts,
         "TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS TZH:TZM')",
         "2012-03-04 05:06:07 +00:00"
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0).and_tz_hm_offset(8, 45);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0)?.and_tz_hm_offset(8, 45)?;
     test_to_sql!(
         &conn,
         &ts,
         "TO_CHAR(:1, 'YYYY-MM-DD HH24:MI:SS TZH:TZM')",
         "2012-03-04 05:06:07 +08:45"
     );
-    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0).and_tz_hm_offset(-8, -45);
+    let ts = Timestamp::new(2012, 3, 4, 5, 6, 7, 0)?.and_tz_hm_offset(-8, -45)?;
     test_to_sql!(
         &conn,
         &ts,
@@ -676,7 +684,7 @@ fn timestamp_to_sql() -> Result<()> {
 fn interval_ds_from_sql() -> Result<()> {
     let conn = common::connect()?;
 
-    let it = IntervalDS::new(1, 2, 3, 4, 0);
+    let it = IntervalDS::new(1, 2, 3, 4, 0)?;
     test_from_sql!(
         &conn,
         "INTERVAL '1 02:03:04' DAY TO SECOND",
@@ -684,7 +692,7 @@ fn interval_ds_from_sql() -> Result<()> {
         &it
     );
 
-    let it = IntervalDS::new(1, 2, 3, 4, 123456789);
+    let it = IntervalDS::new(1, 2, 3, 4, 123456789)?;
     test_from_sql!(
         &conn,
         "INTERVAL '+1 02:03:04.123456789' DAY TO SECOND(9)",
@@ -692,7 +700,7 @@ fn interval_ds_from_sql() -> Result<()> {
         &it
     );
 
-    let it = IntervalDS::new(123456789, 2, 3, 4, 123456789);
+    let it = IntervalDS::new(123456789, 2, 3, 4, 123456789)?;
     test_from_sql!(
         &conn,
         "INTERVAL '+123456789 02:03:04.123456789' DAY(9) TO SECOND(9)",
@@ -700,7 +708,7 @@ fn interval_ds_from_sql() -> Result<()> {
         &it
     );
 
-    let it = IntervalDS::new(-1, -2, -3, -4, 0);
+    let it = IntervalDS::new(-1, -2, -3, -4, 0)?;
     test_from_sql!(
         &conn,
         "INTERVAL '-1 02:03:04' DAY TO SECOND",
@@ -708,7 +716,7 @@ fn interval_ds_from_sql() -> Result<()> {
         &it
     );
 
-    let it = IntervalDS::new(-1, -2, -3, -4, -123456789);
+    let it = IntervalDS::new(-1, -2, -3, -4, -123456789)?;
     test_from_sql!(
         &conn,
         "INTERVAL '-1 02:03:04.123456789' DAY TO SECOND(9)",
@@ -716,7 +724,7 @@ fn interval_ds_from_sql() -> Result<()> {
         &it
     );
 
-    let it = IntervalDS::new(-123456789, -2, -3, -4, -123456789);
+    let it = IntervalDS::new(-123456789, -2, -3, -4, -123456789)?;
     test_from_sql!(
         &conn,
         "INTERVAL '-123456789 02:03:04.123456789' DAY(9) TO SECOND(9)",
@@ -730,22 +738,22 @@ fn interval_ds_from_sql() -> Result<()> {
 fn interval_ds_to_sql() -> Result<()> {
     let conn = common::connect()?;
 
-    let it = IntervalDS::new(1, 2, 3, 4, 0);
+    let it = IntervalDS::new(1, 2, 3, 4, 0)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "+000000001 02:03:04.000000000");
 
-    let it = IntervalDS::new(1, 2, 3, 4, 123456789);
+    let it = IntervalDS::new(1, 2, 3, 4, 123456789)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "+000000001 02:03:04.123456789");
 
-    let it = IntervalDS::new(123456789, 2, 3, 4, 123456789);
+    let it = IntervalDS::new(123456789, 2, 3, 4, 123456789)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "+123456789 02:03:04.123456789");
 
-    let it = IntervalDS::new(-1, -2, -3, -4, 0);
+    let it = IntervalDS::new(-1, -2, -3, -4, 0)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "-000000001 02:03:04.000000000");
 
-    let it = IntervalDS::new(-1, -2, -3, -4, -123456789);
+    let it = IntervalDS::new(-1, -2, -3, -4, -123456789)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "-000000001 02:03:04.123456789");
 
-    let it = IntervalDS::new(-123456789, -2, -3, -4, -123456789);
+    let it = IntervalDS::new(-123456789, -2, -3, -4, -123456789)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "-123456789 02:03:04.123456789");
     Ok(())
 }
@@ -758,7 +766,7 @@ fn interval_ds_to_sql() -> Result<()> {
 fn interval_ym_from_sql() -> Result<()> {
     let conn = common::connect()?;
 
-    let it = IntervalYM::new(1, 2);
+    let it = IntervalYM::new(1, 2)?;
     test_from_sql!(
         &conn,
         "INTERVAL '1-2' YEAR TO MONTH",
@@ -766,7 +774,7 @@ fn interval_ym_from_sql() -> Result<()> {
         &it
     );
 
-    let it = IntervalYM::new(123456789, 2);
+    let it = IntervalYM::new(123456789, 2)?;
     test_from_sql!(
         &conn,
         "INTERVAL '123456789-2' YEAR(9) TO MONTH",
@@ -774,7 +782,7 @@ fn interval_ym_from_sql() -> Result<()> {
         &it
     );
 
-    let it = IntervalYM::new(-1, -2);
+    let it = IntervalYM::new(-1, -2)?;
     test_from_sql!(
         &conn,
         "INTERVAL '-1-2' YEAR TO MONTH",
@@ -782,7 +790,7 @@ fn interval_ym_from_sql() -> Result<()> {
         &it
     );
 
-    let it = IntervalYM::new(-123456789, -2);
+    let it = IntervalYM::new(-123456789, -2)?;
     test_from_sql!(
         &conn,
         "INTERVAL '-123456789-2' YEAR(9) TO MONTH",
@@ -796,15 +804,15 @@ fn interval_ym_from_sql() -> Result<()> {
 fn interval_ym_to_sql() -> Result<()> {
     let conn = common::connect()?;
 
-    let it = IntervalYM::new(1, 2);
+    let it = IntervalYM::new(1, 2)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "+000000001-02");
-    let it = IntervalYM::new(123456789, 2);
+    let it = IntervalYM::new(123456789, 2)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "+123456789-02");
 
-    let it = IntervalYM::new(-1, -2);
+    let it = IntervalYM::new(-1, -2)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "-000000001-02");
 
-    let it = IntervalYM::new(-123456789, -2);
+    let it = IntervalYM::new(-123456789, -2)?;
     test_to_sql!(&conn, &it, "TO_CHAR(:1)", "-123456789-02");
     Ok(())
 }
@@ -819,7 +827,7 @@ mod chrono {
     use chrono::prelude::*;
     use chrono::Duration;
     use oracle::sql_type::OracleType;
-    use oracle::{Error, Result};
+    use oracle::{ErrorKind, Result};
 
     //
     // chrono::DateTime<Utc>
@@ -1251,11 +1259,8 @@ mod chrono {
         // Overflow
         let d = Duration::days(1000000000);
         let mut stmt = conn.statement("begin :out := TO_CHAR(:1); end;").build()?;
-        let bind_result = stmt.bind(2, &d);
-        if let Err(Error::OutOfRange(_)) = bind_result { /* OK */
-        } else {
-            panic!("Duration 1000000000 days should not be converted to interval day to second!");
-        }
+        let err = stmt.bind(2, &d).expect_err("expect out of range error");
+        assert_eq!(err.kind(), ErrorKind::OutOfRange);
         Ok(())
     }
 }

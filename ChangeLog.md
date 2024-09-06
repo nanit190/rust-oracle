@@ -1,5 +1,69 @@
 # Change Log
 
+## 0.6.2 (2024-06-26)
+
+Fixed Issues:
+
+* Fix memory leaks when [`Batch`] is explicitly closed by [`close()`][`Batch::close()`].
+
+## 0.6.1 (2024-06-24)
+
+New features:
+
+* Add [`InitParams`] to initialize the Oracle client library explicitly
+* Add [`DbError::is_recoverable()`] and [`DbError::is_warning()`]
+
+Non-breaking Changes:
+
+* `DbError::new()` uses generics, which supports old types.
+
+Internal Changes:
+
+* Improve performance of iterator for [`ResultSet<T>`][`ResultSet`] where T is [`Row`]
+  by sharing an internal fetch array buffer. Before this change, one row in the buffer
+  is copied to `Row` for each iteration. After this, new fetch array buffer is allocated
+  when more rows must be fetched into a buffer but the buffer is referenced by `Row`s.
+
+## 0.6.0 (2024-05-20)
+
+Breaking changes:
+
+* Remove the lifetype parameter `'conn` from [`Statement`] and remove `stmt_without_lifetime` feature added at 0.5.7
+* Add a new variant [`OracleType::Xml`]
+* Add a lifetime parameter to [`SqlValue`]
+* Change the return type of [`Timestamp::new()`], [`Timestamp::and_tz_offset()`], [`Timestamp::and_tz_hm_offset()`], and [`Timestamp::and_prec()`] to check the arguments
+* Change the return type of [`IntervalDS::new()`] and [`IntervalDS::and_prec()`] to check the arguments
+* Change the return type of [`IntervalYM::new()`] and [`IntervalYM::and_prec()`] to check the arguments
+* Remove [`SqlValue::dup`]
+* Add [`#[non_exhaustive]`] to [`Error`]
+* Remove deprecated trait method [`Error::description`] for [`Error`]
+* Remove [`Connection::prepare()`] and [`StmtParam`]
+
+Deprecated:
+* All variants in [`Error`] enum are deprecated. The enum will be changed to struct in the future.
+
+New features:
+
+* Add [`Row::column_info()`] to tell column names and types in [`RowValue::get()`]
+* Change the lifetime parameter of [`ResultSet`] to `'static` when it is created by query methods of [`Connection`] or into_result_set methods of [`Statement`].
+* `Send` is implemented for the following types:
+  * [`Statement`]
+  * [`ResultSet<'static, T>`][`ResultSet`]
+  * [`Row`]
+  * [`SqlValue`]
+  * [`Object`]
+  * [`Collection`]
+
+Changes:
+
+* Error messages are changed to follow "Error messages are typically concise lowercase sentences without trailing punctuation"
+* Update ODPI-C to 5.1.0. (see [ODPI-C release notes])
+* Update minimum supported Rust version to 1.60.0
+* Update rust edition to 2021
+* Change a undocumented method of the sealed trait [`ColumnIndex`]
+* Add `#[drive(Debug)]` for [`Error`] instead of explicitly implementing `Debug` for `Error`
+* Implement `Error::source` for `Error`
+
 ## 0.5.7 (2023-01-30)
 
 New features:
@@ -20,7 +84,7 @@ Changes:
 
 Internal Changes:
 
-* Update ODPI-C to 4.6.0. (see [ODPI-C release notes](https://oracle.github.io/odpi/doc/releasenotes.html))
+* Update ODPI-C to 4.6.0. (see [ODPI-C release notes])
 
 ## 0.5.6 (2022-08-09)
 
@@ -34,7 +98,7 @@ Changes:
 
 Internal Changes:
 
-* Update ODPI-C to 4.4.1. (see [ODPI-C release notes](https://oracle.github.io/odpi/doc/releasenotes.html))
+* Update ODPI-C to 4.4.1. (see [ODPI-C release notes])
 * Suppress 'cargo clippy' warnings
 * Use atomic types instead of RefCell and Mutex
 
@@ -383,13 +447,19 @@ Incompatible changes:
 [GH-54]: https://github.com/kubo/rust-oracle/issues/54
 [GH-62]: https://github.com/kubo/rust-oracle/pull/62
 [chrono]: https://docs.rs/chrono/latest/chrono/index.html
+[`#[non_exhaustive]`]: https://doc.rust-lang.org/reference/attributes/type_system.html#the-non_exhaustive-attribute
+[`Error::description`]: https://doc.rust-lang.org/std/error/trait.Error.html#method.description
+[`Error::source`]: https://doc.rust-lang.org/std/error/trait.Error.html#method.source
 [`pool`]: https://www.jiubao.org/rust-oracle/oracle/pool/index.html
 [`Batch`]: https://www.jiubao.org/rust-oracle/oracle/struct.Batch.html
+[`Batch::close()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Batch.html#method.close
 [`Collection`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Collection.html
 [`Collection::indices()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Collection.html#method.indices
 [`Collection::iter()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Collection.html#method.iter
 [`Collection::values()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Collection.html#method.values
+[`ColumnIndex`]: https://www.jiubao.org/rust-oracle/oracle/trait.ColumnIndex.html
 [`ColumnInfo::name()`]: https://www.jiubao.org/rust-oracle/oracle/struct.ColumnInfo.html#method.name
+[`Connection`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html
 [`Connection::connect()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.connect
 [`Connection::call_timeout()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.call_timeout
 [`Connection::close_with_mode()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.close_with_mode
@@ -398,7 +468,7 @@ Incompatible changes:
 [`Connection::is_new_connection()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.is_new_connection
 [`Connection::last_warning()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.last_warning
 [`Connection::object_type()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.object_type
-[`Connection::prepare()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.prepare
+[`Connection::prepare()`]: https://docs.rs/oracle/0.5.*/oracle/struct.Connection.html#method.prepare
 [`Connection::query()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.query
 [`Connection::query_named()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.query_named
 [`Connection::query_as()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Connection.html#method.query_as
@@ -417,12 +487,21 @@ Incompatible changes:
 [`ConnStatus`]: https://www.jiubao.org/rust-oracle/oracle/enum.ConnStatus.html
 [`DbError::action()`]: https://www.jiubao.org/rust-oracle/oracle/struct.DbError.html#method.action
 [`DbError::fn_name()`]: https://www.jiubao.org/rust-oracle/oracle/struct.DbError.html#method.fn_name
+[`DbError::is_recoverable()`]: https://www.jiubao.org/rust-oracle/oracle/struct.DbError.html#method.is_recoverable
+[`DbError::is_warning()`]: https://www.jiubao.org/rust-oracle/oracle/struct.DbError.html#method.is_warning
 [`DbError::message()`]: https://www.jiubao.org/rust-oracle/oracle/struct.DbError.html#method.message
 [`DbError::offset()`]: https://www.jiubao.org/rust-oracle/oracle/struct.DbError.html#method.offset
 [`Eq`]: https://doc.rust-lang.org/std/cmp/trait.Eq.html
+[`Error`]: https://www.jiubao.org/rust-oracle/oracle/enum.Error.html
 [`Error::NoDataFound`]: https://www.jiubao.org/rust-oracle/oracle/enum.Error.html#variant.NoDataFound
 [`Error::OutOfRange`]: https://www.jiubao.org/rust-oracle/oracle/enum.Error.html#variant.OutOfRange
 [`FromSql::from_sql`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/trait.FromSql.html#method.from_sql
+[`InitParams`]: https://www.jiubao.org/rust-oracle/oracle/struct.InitParams.html
+[`IntervalDS::and_prec()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.IntervalDS.html#method.and_prec
+[`IntervalDS::new()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.IntervalDS.html#method.new
+[`IntervalYM::and_prec()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.IntervalYM.html#method.and_prec
+[`IntervalYM::new()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.IntervalYM.html#method.new
+[`Object`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Object.html
 [`ObjectType::attributes()`]: https://docs.rs/oracle/0.2.*/oracle/struct.ObjectType.html#method.attributes
 [`ObjectType::name()`]: https://docs.rs/oracle/0.2.*/oracle/struct.ObjectType.html#method.name
 [`ObjectType::new_collection()`]: https://docs.rs/oracle/0.2.*/oracle/struct.ObjectType.html#method.new_collection
@@ -430,11 +509,20 @@ Incompatible changes:
 [`ObjectType::schema()`]: https://docs.rs/oracle/0.2.*/oracle/struct.ObjectType.html#method.schema
 [`ObjectType::package_name()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.ObjectType.html#method.package_name
 [`ObjectTypeAttr::name()`]: https://docs.rs/oracle/0.2.*/oracle/struct.ObjectTypeAttr.html#method.name
+[ODPI-C release notes]: https://oracle.github.io/odpi/doc/releasenotes.html
+[`OracleType::Xml`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/enum.OracleType.html#variant.Xml
+[`ResultSet`]: https://www.jiubao.org/rust-oracle/oracle/struct.ResultSet.html
 [`ResultSet::column_info()`]: https://www.jiubao.org/rust-oracle/oracle/struct.ResultSet.html#method.column_info
+[`Row`]: https://www.jiubao.org/rust-oracle/oracle/struct.Row.html
+[`Row::column_info()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Row.html#method.column_info
 [`Row::sql_values()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Row.html#method.sql_values
 [`Row::get_as()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Row.html#method.get_as
 [`RowValue`]: https://www.jiubao.org/rust-oracle/oracle/trait.RowValue.html
+[`RowValue::get()`]: https://www.jiubao.org/rust-oracle/oracle/trait.RowValue.html#tymethod.get
 [`RowValue` derive macro]: https://www.jiubao.org/rust-oracle/oracle/derive.RowValue.html
+[`SqlValue`]: https://www.jiubao.org/rust-oracle/oracle/struct.SqlValue.html
+[`SqlValue::dup`]: https://docs.rs/oracle/0.5.7/oracle/struct.SqlValue.html#method.dup
+[`Statement`]: https://www.jiubao.org/rust-oracle/oracle/struct.Statement.html
 [`Statement::close()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Statement.html#method.close
 [`Statement::last_row_id()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Statement.html#method.last_row_id
 [`Statement::execute()`]: https://www.jiubao.org/rust-oracle/oracle/struct.Statement.html#method.execute
@@ -457,5 +545,9 @@ Incompatible changes:
 [`StatementBuilder::exclude_from_cache()`]: https://www.jiubao.org/rust-oracle/oracle/struct.StatementBuilder.html#method.exclude_from_cache
 [`StatementBuilder::prefetch_rows()`]: https://www.jiubao.org/rust-oracle/oracle/struct.StatementBuilder.html#method.prefetch_rows
 [`StatementBuilder::tag()`]: https://www.jiubao.org/rust-oracle/oracle/struct.StatementBuilder.html#method.tag
-[`StmtParam`]: https://www.jiubao.org/rust-oracle/oracle/enum.StmtParam.html
-[`StmtParam::FetchArraySize`]: https://www.jiubao.org/rust-oracle/oracle/enum.StmtParam.html#variant.FetchArraySize
+[`StmtParam`]: https://docs.rs/oracle/0.5.*/oracle/enum.StmtParam.html
+[`StmtParam::FetchArraySize`]: https://docs.rs/oracle/0.5.*/oracle/enum.StmtParam.html#variant.FetchArraySize
+[`Timestamp::and_prec()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Timestamp.html#method.and_prec
+[`Timestamp::and_tz_hm_offset()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Timestamp.html#method.and_tz_hm_offset
+[`Timestamp::and_tz_offset()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Timestamp.html#method.and_tz_offset
+[`Timestamp::new()`]: https://www.jiubao.org/rust-oracle/oracle/sql_type/struct.Timestamp.html#method.new

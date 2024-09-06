@@ -13,17 +13,13 @@
 // (ii) the Apache License v 2.0. (http://www.apache.org/licenses/LICENSE-2.0)
 //-----------------------------------------------------------------------------
 
-#[cfg(feature = "stmt_without_lifetime")]
-use oracle_procmacro::remove_stmt_lifetime;
 use std::borrow::ToOwned;
 use std::fmt;
-#[cfg(not(feature = "stmt_without_lifetime"))]
-use std::marker::PhantomData;
 use std::mem::MaybeUninit;
 use std::os::raw::c_char;
 use std::ptr;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use crate::binding::*;
 use crate::chkerr;
@@ -39,11 +35,13 @@ use crate::sql_type::ToSql;
 #[cfg(doc)]
 use crate::sql_type::{Blob, Clob, Nclob};
 use crate::sql_value::BufferRowIndex;
-use crate::to_odpi_str;
 use crate::to_rust_str;
+use crate::AssertSend;
 use crate::Connection;
 use crate::Context;
+use crate::DpiStmt;
 use crate::Error;
+use crate::OdpiStr;
 use crate::Result;
 use crate::ResultSet;
 use crate::Row;
@@ -90,7 +88,6 @@ pub struct StatementBuilder<'conn, 'sql> {
     exclude_from_cache: bool,
 }
 
-#[cfg_attr(feature = "stmt_without_lifetime", remove_stmt_lifetime)]
 impl<'conn, 'sql> StatementBuilder<'conn, 'sql> {
     pub(crate) fn new(conn: &'conn Connection, sql: &'sql str) -> StatementBuilder<'conn, 'sql> {
         StatementBuilder {
@@ -126,7 +123,7 @@ impl<'conn, 'sql> StatementBuilder<'conn, 'sql> {
     /// assert_eq!(stmt.query_row_as::<String>(&[&2])?, "String 2");
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn fetch_array_size<'a>(&'a mut self, size: u32) -> &'a mut StatementBuilder<'conn, 'sql> {
+    pub fn fetch_array_size(&mut self, size: u32) -> &mut StatementBuilder<'conn, 'sql> {
         self.query_params.fetch_array_size = size;
         self
     }
@@ -140,7 +137,7 @@ impl<'conn, 'sql> StatementBuilder<'conn, 'sql> {
     /// Setting this value to 0 will disable prefetch completely,
     /// which may be useful when the timing for fetching rows must be
     /// controlled by the caller.
-    pub fn prefetch_rows<'a>(&'a mut self, size: u32) -> &'a mut StatementBuilder<'conn, 'sql> {
+    pub fn prefetch_rows(&mut self, size: u32) -> &mut StatementBuilder<'conn, 'sql> {
         self.query_params.prefetch_rows = Some(size);
         self
     }
@@ -182,14 +179,8 @@ impl<'conn, 'sql> StatementBuilder<'conn, 'sql> {
     /// }
     /// # Ok::<(), Box::<dyn std::error::Error>>(())
     /// ```
-    pub fn lob_locator<'a>(&'a mut self) -> &'a mut StatementBuilder<'conn, 'sql> {
+    pub fn lob_locator(&mut self) -> &mut StatementBuilder<'conn, 'sql> {
         self.query_params.lob_bind_type = LobBindType::Locator;
-        self
-    }
-
-    // make the visibility public when scrollable cursors is supported.
-    fn scrollable<'a>(&'a mut self, scrollable: bool) -> &'a mut StatementBuilder<'conn, 'sql> {
-        self.scrollable = scrollable;
         self
     }
 
@@ -245,7 +236,7 @@ impl<'conn, 'sql> StatementBuilder<'conn, 'sql> {
     /// # assert_eq!(stmt.query_row_as::<i32>(&[])?, 2);
     /// # Ok::<(), Error>(())
     /// ```
-    pub fn tag<'a, T>(&'a mut self, tag_name: T) -> &'a mut StatementBuilder<'conn, 'sql>
+    pub fn tag<T>(&mut self, tag_name: T) -> &mut StatementBuilder<'conn, 'sql>
     where
         T: Into<String>,
     {
@@ -254,40 +245,14 @@ impl<'conn, 'sql> StatementBuilder<'conn, 'sql> {
     }
 
     /// Excludes the statement from the cache even when stmt_cache_size is not zero.
-    pub fn exclude_from_cache<'a>(&'a mut self) -> &'a mut StatementBuilder<'conn, 'sql> {
+    pub fn exclude_from_cache(&mut self) -> &mut StatementBuilder<'conn, 'sql> {
         self.exclude_from_cache = true;
         self
     }
 
-    pub fn build(&self) -> Result<Statement<'conn>> {
+    pub fn build(&self) -> Result<Statement> {
         Statement::new(self)
     }
-}
-
-/// Parameters of [`Connection::prepare`]
-///
-/// No new variants are added to this enum in the future. That's because
-/// a new variant causes breaking changes. New configuration parameters
-/// are set via [`StatementBuilder`][] instead.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StmtParam {
-    /// The array size used for performing fetches.
-    ///
-    /// This specifies the number of rows allocated before performing
-    /// fetches. The default value is 100. Higher value reduces
-    /// the number of network round trips to fetch rows but requires
-    /// more memory. The preferable value depends on the query and
-    /// the environment.
-    ///
-    /// If the query returns only onw row, you should use
-    /// `StmtParam::FetchArraySize(1)`.
-    FetchArraySize(u32),
-
-    /// See [`StatementBuilder::tag`].
-    Tag(String),
-
-    /// Reserved for when scrollable cursors are supported.
-    Scrollable,
 }
 
 /// Statement type returned by [`Statement::statement_type`].
@@ -392,27 +357,24 @@ impl fmt::Display for StatementType {
 #[derive(Debug)]
 pub(crate) struct Stmt {
     pub(crate) conn: Conn,
-    pub(crate) handle: *mut dpiStmt,
-    pub(crate) column_info: Vec<ColumnInfo>,
+    pub(crate) handle: DpiStmt,
     pub(crate) row: Option<Row>,
-    shared_buffer_row_index: Rc<AtomicU32>,
+    shared_buffer_row_index: Arc<AtomicU32>,
+    last_buffer_row_index: u32,
+    more_rows: bool,
     pub(crate) query_params: QueryParams,
     tag: String,
 }
 
 impl Stmt {
-    pub(crate) fn new(
-        conn: Conn,
-        handle: *mut dpiStmt,
-        query_params: QueryParams,
-        tag: String,
-    ) -> Stmt {
+    pub(crate) fn new(conn: Conn, handle: DpiStmt, query_params: QueryParams, tag: String) -> Stmt {
         Stmt {
             conn,
             handle,
-            column_info: Vec::new(),
             row: None,
-            shared_buffer_row_index: Rc::new(AtomicU32::new(0)),
+            shared_buffer_row_index: Arc::new(AtomicU32::new(0)),
+            last_buffer_row_index: 0,
+            more_rows: false,
             query_params,
             tag,
         }
@@ -427,131 +389,131 @@ impl Stmt {
     }
 
     pub(crate) fn handle(&self) -> *mut dpiStmt {
-        self.handle
+        self.handle.raw
     }
 
     fn close(&mut self) -> Result<()> {
-        let tag = to_odpi_str(&self.tag);
-        chkerr!(self.ctxt(), dpiStmt_close(self.handle, tag.ptr, tag.len));
+        let tag = OdpiStr::new(&self.tag);
+        chkerr!(self.ctxt(), dpiStmt_close(self.handle(), tag.ptr, tag.len));
         Ok(())
     }
 
     pub(crate) fn init_row(&mut self, num_cols: usize) -> Result<()> {
-        let mut column_names = Vec::with_capacity(num_cols);
+        self.shared_buffer_row_index.store(0, Ordering::Relaxed);
+        self.last_buffer_row_index = 0;
+        self.more_rows = true;
+        if self.row.is_some() {
+            return Ok(());
+        }
+        let mut column_info = Vec::with_capacity(num_cols);
         let mut column_values = Vec::with_capacity(num_cols);
-        self.column_info = Vec::with_capacity(num_cols);
 
         for i in 0..num_cols {
-            // set column info
-            let ci = ColumnInfo::new(self, i)?;
-            column_names.push(ci.name.clone());
-            self.column_info.push(ci);
-            // setup column value
-            let mut val = SqlValue::for_column(
+            let info = ColumnInfo::new(self, i)?;
+            let val = SqlValue::for_column(
                 self.conn.clone(),
                 self.query_params.clone(),
-                self.query_params.fetch_array_size,
-            );
-            val.buffer_row_index = BufferRowIndex::Shared(self.shared_buffer_row_index.clone());
-            let oratype = self.column_info[i].oracle_type();
-            let oratype_i64 = OracleType::Int64;
-            let oratype = match *oratype {
-                // When the column type is number whose prec is less than 18
-                // and the scale is zero, define it as int64.
-                OracleType::Number(prec, 0) if 0 < prec && prec < DPI_MAX_INT64_PRECISION as u8 => {
-                    &oratype_i64
-                }
-                _ => oratype,
-            };
-            val.init_handle(oratype)?;
-            chkerr!(
-                self.ctxt(),
-                dpiStmt_define(self.handle, (i + 1) as u32, val.handle)
-            );
+                self.shared_buffer_row_index.clone(),
+                info.oracle_type(),
+                self.handle(),
+                (i + 1) as u32,
+            )?;
+            column_info.push(info);
             column_values.push(val);
         }
-        self.row = Some(Row::new(column_names, column_values)?);
+        self.row = Some(Row::new(column_info, column_values)?);
         Ok(())
     }
 
-    fn try_next(&self) -> Result<Option<&Row>> {
-        let mut found = 0;
-        let mut buffer_row_index = 0;
-        chkerr!(
-            self.ctxt(),
-            dpiStmt_fetch(self.handle, &mut found, &mut buffer_row_index)
-        );
-        Ok(if found != 0 {
+    fn try_next(&mut self) -> Result<Option<&Row>> {
+        let index = self.shared_buffer_row_index.load(Ordering::Relaxed);
+        let last_index = self.last_buffer_row_index;
+        if index + 1 < last_index {
             self.shared_buffer_row_index
-                .store(buffer_row_index, Ordering::Relaxed);
-            // if self.row.is_none(), dpiStmt_fetch() returns non-zero.
-            Some(self.row.as_ref().unwrap())
+                .store(index + 1, Ordering::Relaxed);
+            Ok(Some(self.row.as_ref().unwrap()))
+        } else if self.more_rows && self.fetch_rows()? {
+            Ok(Some(self.row.as_ref().unwrap()))
         } else {
-            None
-        })
+            Ok(None)
+        }
     }
 
-    pub fn next(&self) -> Option<Result<&Row>> {
+    pub fn next(&mut self) -> Option<Result<&Row>> {
         self.try_next().transpose()
+    }
+
+    pub fn fetch_rows(&mut self) -> Result<bool> {
+        let handle = self.handle();
+        let row = self.row.as_mut().unwrap();
+        for i in 0..(row.column_info.len()) {
+            // If fetch array buffer is referenced only by self, it is reusable.
+            // Otherwise, a new SqlValue must be created to allocate a new buffer
+            // because dpiStmt_fetchRows() overwrites the buffer.
+            if row.column_values[i].fetch_array_buffer_shared_count()? > 1 {
+                let oratype = row.column_info[i].oracle_type();
+                row.column_values[i] = SqlValue::for_column(
+                    self.conn.clone(),
+                    self.query_params.clone(),
+                    self.shared_buffer_row_index.clone(),
+                    oratype,
+                    handle,
+                    (i + 1) as u32,
+                )?;
+            }
+        }
+        let mut new_index = 0;
+        let mut num_rows = 0;
+        let mut more_rows = 0;
+        chkerr!(
+            self.ctxt(),
+            dpiStmt_fetchRows(
+                handle,
+                self.query_params.fetch_array_size,
+                &mut new_index,
+                &mut num_rows,
+                &mut more_rows
+            )
+        );
+        self.shared_buffer_row_index
+            .store(new_index, Ordering::Relaxed);
+        self.last_buffer_row_index = new_index + num_rows;
+        self.more_rows = more_rows != 0;
+        Ok(num_rows != 0)
     }
 
     pub fn row_count(&self) -> Result<u64> {
         let mut count = 0;
-        chkerr!(self.ctxt(), dpiStmt_getRowCount(self.handle, &mut count));
+        chkerr!(self.ctxt(), dpiStmt_getRowCount(self.handle(), &mut count));
         Ok(count)
     }
 }
 
+impl AssertSend for Stmt {}
+
 impl Drop for Stmt {
     fn drop(&mut self) {
         let _ = self.close();
-        unsafe { dpiStmt_release(self.handle) };
     }
 }
 
 /// Statement
-#[cfg_attr(feature = "stmt_without_lifetime", remove_stmt_lifetime)]
 #[derive(Debug)]
-pub struct Statement<'conn> {
+pub struct Statement {
     pub(crate) stmt: Stmt,
     statement_type: StatementType,
     is_returning: bool,
     bind_count: usize,
     bind_names: Vec<String>,
-    bind_values: Vec<SqlValue>,
-    #[cfg(not(feature = "stmt_without_lifetime"))]
-    phantom: PhantomData<&'conn ()>,
+    bind_values: Vec<SqlValue<'static>>,
 }
 
-#[cfg_attr(feature = "stmt_without_lifetime", remove_stmt_lifetime)]
-impl<'conn> Statement<'conn> {
-    pub(crate) fn from_params(
-        conn: &'conn Connection,
-        sql: &str,
-        params: &[StmtParam],
-    ) -> Result<Statement<'conn>> {
-        let mut builder = conn.statement(sql);
-        for param in params {
-            match param {
-                StmtParam::FetchArraySize(size) => {
-                    builder.fetch_array_size(*size);
-                }
-                StmtParam::Scrollable => {
-                    builder.scrollable(true);
-                }
-                StmtParam::Tag(name) => {
-                    builder.tag(name);
-                }
-            }
-        }
-        builder.build()
-    }
-
-    fn new(builder: &StatementBuilder<'conn, '_>) -> Result<Statement<'conn>> {
+impl Statement {
+    fn new(builder: &StatementBuilder<'_, '_>) -> Result<Statement> {
         let conn = builder.conn;
-        let sql = to_odpi_str(builder.sql);
-        let tag = to_odpi_str(&builder.tag);
-        let mut handle: *mut dpiStmt = ptr::null_mut();
+        let sql = OdpiStr::new(builder.sql);
+        let tag = OdpiStr::new(&builder.tag);
+        let mut handle = DpiStmt::null();
         chkerr!(
             conn.ctxt(),
             dpiConn_prepareStmt(
@@ -561,26 +523,14 @@ impl<'conn> Statement<'conn> {
                 sql.len,
                 tag.ptr,
                 tag.len,
-                &mut handle
+                &mut handle.raw
             )
         );
         let mut info = MaybeUninit::uninit();
-        chkerr!(
-            conn.ctxt(),
-            dpiStmt_getInfo(handle, info.as_mut_ptr()),
-            unsafe {
-                dpiStmt_release(handle);
-            }
-        );
+        chkerr!(conn.ctxt(), dpiStmt_getInfo(handle.raw, info.as_mut_ptr()));
         let info = unsafe { info.assume_init() };
         let mut num = 0;
-        chkerr!(
-            conn.ctxt(),
-            dpiStmt_getBindCount(handle, &mut num),
-            unsafe {
-                dpiStmt_release(handle);
-            }
-        );
+        chkerr!(conn.ctxt(), dpiStmt_getBindCount(handle.raw, &mut num));
         let bind_count = num as usize;
         let mut bind_names = Vec::with_capacity(bind_count);
         let mut bind_values = Vec::with_capacity(bind_count);
@@ -589,10 +539,12 @@ impl<'conn> Statement<'conn> {
             let mut lengths = vec![0; bind_count];
             chkerr!(
                 conn.ctxt(),
-                dpiStmt_getBindNames(handle, &mut num, names.as_mut_ptr(), lengths.as_mut_ptr()),
-                unsafe {
-                    dpiStmt_release(handle);
-                }
+                dpiStmt_getBindNames(
+                    handle.raw,
+                    &mut num,
+                    names.as_mut_ptr(),
+                    lengths.as_mut_ptr()
+                )
             );
             bind_names = Vec::with_capacity(num as usize);
             for i in 0..(num as usize) {
@@ -605,9 +557,7 @@ impl<'conn> Statement<'conn> {
             }
         };
         let tag = if builder.exclude_from_cache {
-            chkerr!(conn.ctxt(), dpiStmt_deleteFromCache(handle), unsafe {
-                dpiStmt_release(handle);
-            });
+            chkerr!(conn.ctxt(), dpiStmt_deleteFromCache(handle.raw));
             String::new()
         } else {
             builder.tag.clone()
@@ -619,8 +569,6 @@ impl<'conn> Statement<'conn> {
             bind_count,
             bind_names,
             bind_values,
-            #[cfg(not(feature = "stmt_without_lifetime"))]
-            phantom: PhantomData,
         })
     }
 
@@ -638,7 +586,7 @@ impl<'conn> Statement<'conn> {
     }
 
     pub(crate) fn handle(&self) -> *mut dpiStmt {
-        self.stmt.handle
+        self.stmt.handle.raw
     }
 
     /// Executes the prepared statement and returns a result set containing [`Row`]s.
@@ -648,7 +596,7 @@ impl<'conn> Statement<'conn> {
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
     pub fn query(&mut self, params: &[&dyn ToSql]) -> Result<ResultSet<Row>> {
         self.exec(params, true, "query")?;
-        Ok(ResultSet::<Row>::new(&self.stmt))
+        Ok(ResultSet::<Row>::new(&mut self.stmt))
     }
 
     /// Executes the prepared statement using named parameters and returns a result set containing [`Row`]s.
@@ -658,7 +606,7 @@ impl<'conn> Statement<'conn> {
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
     pub fn query_named(&mut self, params: &[(&str, &dyn ToSql)]) -> Result<ResultSet<Row>> {
         self.exec_named(params, true, "query_named")?;
-        Ok(ResultSet::<Row>::new(&self.stmt))
+        Ok(ResultSet::<Row>::new(&mut self.stmt))
     }
 
     /// Executes the prepared statement and returns a result set containing [`RowValue`]s.
@@ -666,12 +614,12 @@ impl<'conn> Statement<'conn> {
     /// See [Query Methods][].
     ///
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
-    pub fn query_as<'a, T>(&'a mut self, params: &[&dyn ToSql]) -> Result<ResultSet<'a, T>>
+    pub fn query_as<T>(&mut self, params: &[&dyn ToSql]) -> Result<ResultSet<T>>
     where
         T: RowValue,
     {
         self.exec(params, true, "query_as")?;
-        Ok(ResultSet::new(&self.stmt))
+        Ok(ResultSet::new(&mut self.stmt))
     }
 
     /// Executes the prepared statement and returns a result set containing [`RowValue`]s.
@@ -681,7 +629,7 @@ impl<'conn> Statement<'conn> {
     /// See [Query Methods][].
     ///
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
-    pub fn into_result_set<'a, T>(mut self, params: &[&dyn ToSql]) -> Result<ResultSet<'a, T>>
+    pub fn into_result_set<T>(mut self, params: &[&dyn ToSql]) -> Result<ResultSet<'static, T>>
     where
         T: RowValue,
     {
@@ -694,15 +642,12 @@ impl<'conn> Statement<'conn> {
     /// See [Query Methods][].
     ///
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
-    pub fn query_as_named<'a, T>(
-        &'a mut self,
-        params: &[(&str, &dyn ToSql)],
-    ) -> Result<ResultSet<'a, T>>
+    pub fn query_as_named<T>(&mut self, params: &[(&str, &dyn ToSql)]) -> Result<ResultSet<T>>
     where
         T: RowValue,
     {
         self.exec_named(params, true, "query_as_named")?;
-        Ok(ResultSet::new(&self.stmt))
+        Ok(ResultSet::new(&mut self.stmt))
     }
 
     /// Executes the prepared statement using named parameters and returns a result set containing [`RowValue`]s.
@@ -712,10 +657,10 @@ impl<'conn> Statement<'conn> {
     /// See [Query Methods][].
     ///
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
-    pub fn into_result_set_named<'a, T>(
+    pub fn into_result_set_named<T>(
         mut self,
         params: &[(&str, &dyn ToSql)],
-    ) -> Result<ResultSet<'a, T>>
+    ) -> Result<ResultSet<'static, T>>
     where
         T: RowValue,
     {
@@ -730,7 +675,7 @@ impl<'conn> Statement<'conn> {
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
     pub fn query_row(&mut self, params: &[&dyn ToSql]) -> Result<Row> {
         let mut rows = self.query(params)?;
-        rows.next().unwrap_or(Err(Error::NoDataFound))
+        rows.next().unwrap_or(Err(Error::no_data_found()))
     }
 
     /// Gets one row from the prepared statement using named bind parameters.
@@ -740,7 +685,7 @@ impl<'conn> Statement<'conn> {
     /// [Query Methods]: https://github.com/kubo/rust-oracle/blob/master/docs/query-methods.md
     pub fn query_row_named(&mut self, params: &[(&str, &dyn ToSql)]) -> Result<Row> {
         let mut rows = self.query_named(params)?;
-        rows.next().unwrap_or(Err(Error::NoDataFound))
+        rows.next().unwrap_or(Err(Error::no_data_found()))
     }
 
     /// Gets one row from the prepared statement as specified type using positoinal bind parameters.
@@ -753,7 +698,7 @@ impl<'conn> Statement<'conn> {
         T: RowValue,
     {
         let mut rows = self.query_as::<T>(params)?;
-        rows.next().unwrap_or(Err(Error::NoDataFound))
+        rows.next().unwrap_or(Err(Error::no_data_found()))
     }
 
     /// Gets one row from the prepared statement as specified type using named bind parameters.
@@ -766,7 +711,7 @@ impl<'conn> Statement<'conn> {
         T: RowValue,
     {
         let mut rows = self.query_as_named::<T>(params)?;
-        rows.next().unwrap_or(Err(Error::NoDataFound))
+        rows.next().unwrap_or(Err(Error::no_data_found()))
     }
 
     /// Binds values by position and executes the statement.
@@ -829,16 +774,16 @@ impl<'conn> Statement<'conn> {
             if self.statement_type == StatementType::Select {
                 Ok(())
             } else {
-                Err(Error::InvalidOperation(format!(
-                    "Could not use the `{}` method for non-select statements",
+                Err(Error::invalid_operation(format!(
+                    "could not use the `{}` method for non-select statements",
                     method_name
                 )))
             }
         } else if self.statement_type != StatementType::Select {
             Ok(())
         } else {
-            Err(Error::InvalidOperation(format!(
-                "Could not use the `{}` method for select statements",
+            Err(Error::invalid_operation(format!(
+                "could not use the `{}` method for select statements",
                 method_name
             )))
         }
@@ -900,7 +845,7 @@ impl<'conn> Statement<'conn> {
                 _ => (),
             }
         }
-        if self.statement_type == StatementType::Select && self.stmt.row.is_none() {
+        if self.statement_type == StatementType::Select {
             self.stmt.init_row(num_query_columns as usize)?;
         }
         if self.is_returning {
@@ -989,7 +934,7 @@ impl<'conn> Statement<'conn> {
         if self.bind_values[pos].init_handle(&value.oratype(&conn)?)? {
             chkerr!(
                 self.ctxt(),
-                bindidx.bind(self.handle(), self.bind_values[pos].handle)
+                bindidx.bind(self.handle(), self.bind_values[pos].handle()?)
             );
         }
         self.bind_values[pos].set(value)
@@ -1077,7 +1022,7 @@ impl<'conn> Statement<'conn> {
         if rows == 0 {
             return Ok(vec![]);
         }
-        let mut sqlval = self.bind_values[bindidx.idx(self)?].unsafely_clone();
+        let mut sqlval = self.bind_values[bindidx.idx(self)?].clone_with_narrow_lifetime()?;
         if rows > sqlval.array_size as u64 {
             rows = sqlval.array_size as u64;
         }
@@ -1178,22 +1123,19 @@ impl<'conn> Statement<'conn> {
     /// # Ok::<(), Error>(())
     /// ```
     pub fn implicit_result(&self) -> Result<Option<RefCursor>> {
-        let mut handle = ptr::null_mut();
+        let mut handle = DpiStmt::null();
         chkerr!(
             self.ctxt(),
-            dpiStmt_getImplicitResult(self.handle(), &mut handle)
+            dpiStmt_getImplicitResult(self.handle(), &mut handle.raw)
         );
         if handle.is_null() {
             Ok(None)
         } else {
-            let cursor = RefCursor::from_raw(
+            let cursor = RefCursor::from_handle(
                 self.stmt.conn.clone(),
                 handle,
                 self.stmt.query_params.clone(),
             )?;
-            unsafe {
-                dpiStmt_release(handle);
-            }
             Ok(Some(cursor))
         }
     }
@@ -1296,6 +1238,8 @@ impl<'conn> Statement<'conn> {
         unsafe { <T::DataType>::set(&mut attr_value, value) }
     }
 }
+
+impl AssertSend for Statement {}
 
 /// Column information in a select statement
 ///
@@ -1400,7 +1344,7 @@ impl BindIndex for usize {
         if 0 < num && 1 <= *self && *self <= num {
             Ok(*self - 1)
         } else {
-            Err(Error::InvalidBindIndex(*self))
+            Err(Error::invalid_bind_index(*self))
         }
     }
 
@@ -1409,17 +1353,17 @@ impl BindIndex for usize {
     }
 }
 
-impl<'a> BindIndex for &'a str {
+impl BindIndex for &str {
     fn idx(&self, stmt: &Statement) -> Result<usize> {
         let bindname = self.to_uppercase();
         stmt.bind_names()
             .iter()
             .position(|&name| name == bindname)
-            .ok_or_else(|| Error::InvalidBindName((*self).to_string()))
+            .ok_or_else(|| Error::invalid_bind_name(*self))
     }
 
     unsafe fn bind(&self, stmt_handle: *mut dpiStmt, var_handle: *mut dpiVar) -> i32 {
-        let s = to_odpi_str(self);
+        let s = OdpiStr::new(self);
         dpiStmt_bindByName(stmt_handle, s.ptr, s.len, var_handle)
     }
 }
@@ -1430,28 +1374,28 @@ impl<'a> BindIndex for &'a str {
 pub trait ColumnIndex: private::Sealed {
     /// Returns the index of the column specified by `self`.
     #[doc(hidden)]
-    fn idx(&self, column_names: &[String]) -> Result<usize>;
+    fn idx(&self, column_info: &[ColumnInfo]) -> Result<usize>;
 }
 
 impl ColumnIndex for usize {
-    fn idx(&self, column_names: &[String]) -> Result<usize> {
-        let ncols = column_names.len();
+    fn idx(&self, column_info: &[ColumnInfo]) -> Result<usize> {
+        let ncols = column_info.len();
         if *self < ncols {
             Ok(*self)
         } else {
-            Err(Error::InvalidColumnIndex(*self))
+            Err(Error::invalid_column_index(*self))
         }
     }
 }
 
-impl<'a> ColumnIndex for &'a str {
-    fn idx(&self, column_names: &[String]) -> Result<usize> {
-        for (idx, colname) in column_names.iter().enumerate() {
-            if colname.as_str().eq_ignore_ascii_case(self) {
+impl ColumnIndex for &str {
+    fn idx(&self, column_info: &[ColumnInfo]) -> Result<usize> {
+        for (idx, info) in column_info.iter().enumerate() {
+            if info.name.as_str().eq_ignore_ascii_case(self) {
                 return Ok(idx);
             }
         }
-        Err(Error::InvalidColumnName((*self).to_string()))
+        Err(Error::invalid_column_name(*self))
     }
 }
 
@@ -1536,20 +1480,30 @@ mod tests {
         assert_eq!(colinfo[0].name(), "INTCOL");
         assert_eq!(colinfo[0].oracle_type(), &OracleType::Number(9, 0));
         assert_eq!(colinfo[1].name(), "XMLCOL");
-        // xmltype is reported as long. (https://github.com/oracle/odpi/commit/d51e9c496381427dd09f7fb0cbaab3e152667026)
-        assert_eq!(colinfo[1].oracle_type(), &OracleType::Long);
+        assert_eq!(colinfo[1].oracle_type(), &OracleType::Xml);
         assert_eq!(colinfo.len(), 2);
 
         Ok(())
     }
-}
 
-#[cfg_attr(feature = "stmt_without_lifetime", doc = "```")]
-#[cfg_attr(not(feature = "stmt_without_lifetime"), doc = "```compile_fail")]
-/// # use oracle::Statement;
-/// struct Statements {
-///   stmts: Vec<Statement>,
-/// }
-/// ```
-#[cfg(doctest)]
-struct TestStmtWithoutLifetime;
+    #[test]
+    fn fetch_rows_to_vec() -> Result<()> {
+        let conn = test_util::connect()?;
+        // The fetch array size must be less than the number of rows in TestStrings
+        // in order to make situation that a new fetch array buffer must allocated
+        // in Stmt::fetch_rows().
+        let mut stmt = conn
+            .statement("select IntCol from TestStrings order by IntCol")
+            .fetch_array_size(3)
+            .build()?;
+        let mut rows = Vec::new();
+        for row_result in stmt.query(&[])? {
+            rows.push(row_result?);
+        }
+        for (index, row) in rows.iter().enumerate() {
+            let int_col: usize = row.get(0)?;
+            assert_eq!(int_col, index + 1);
+        }
+        Ok(())
+    }
+}

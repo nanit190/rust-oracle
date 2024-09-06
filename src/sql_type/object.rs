@@ -17,7 +17,6 @@ use std::cmp;
 use std::fmt;
 use std::mem::{self, MaybeUninit};
 use std::os::raw::c_char;
-use std::ptr;
 use std::sync::Arc;
 
 use crate::binding::*;
@@ -29,8 +28,10 @@ use crate::sql_type::OracleType;
 use crate::sql_type::ToSql;
 use crate::to_rust_str;
 use crate::util::write_literal;
+use crate::AssertSend;
 use crate::Connection;
 use crate::Context;
+use crate::DpiObject;
 use crate::DpiObjectAttr;
 use crate::DpiObjectType;
 use crate::Error;
@@ -77,12 +78,12 @@ unsafe fn release_dpi_data(data: &dpiData, native_type_num: u32) {
 /// Note: Methods in the type may be changed in future.
 pub struct Collection {
     conn: Conn,
-    pub(crate) handle: *mut dpiObject,
+    pub(crate) handle: DpiObject,
     objtype: ObjectType,
 }
 
 impl Collection {
-    pub(crate) fn new(conn: Conn, handle: *mut dpiObject, objtype: ObjectType) -> Collection {
+    pub(crate) fn new(conn: Conn, handle: DpiObject, objtype: ObjectType) -> Collection {
         Collection {
             conn,
             handle,
@@ -92,6 +93,10 @@ impl Collection {
 
     pub(crate) fn ctxt(&self) -> &Context {
         self.conn.ctxt()
+    }
+
+    fn handle(&self) -> *mut dpiObject {
+        self.handle.raw
     }
 
     /// Returns type information.
@@ -106,7 +111,7 @@ impl Collection {
     /// [OCICollSize()]: https://www.oracle.com/pls/topic/lookup?ctx=dblatest&id=GUID-B8F6665F-12F1-43DB-A27E-82A2A655D701
     pub fn size(&self) -> Result<i32> {
         let mut size = 0;
-        chkerr!(self.ctxt(), dpiObject_getSize(self.handle, &mut size));
+        chkerr!(self.ctxt(), dpiObject_getSize(self.handle(), &mut size));
         Ok(size)
     }
 
@@ -257,12 +262,12 @@ impl Collection {
         let mut exists = 0;
         chkerr!(
             self.ctxt(),
-            dpiObject_getFirstIndex(self.handle, &mut index, &mut exists)
+            dpiObject_getFirstIndex(self.handle(), &mut index, &mut exists)
         );
         if exists != 0 {
             Ok(index)
         } else {
-            Err(Error::NoDataFound)
+            Err(Error::no_data_found())
         }
     }
 
@@ -274,12 +279,12 @@ impl Collection {
         let mut exists = 0;
         chkerr!(
             self.ctxt(),
-            dpiObject_getLastIndex(self.handle, &mut index, &mut exists)
+            dpiObject_getLastIndex(self.handle(), &mut index, &mut exists)
         );
         if exists != 0 {
             Ok(index)
         } else {
-            Err(Error::NoDataFound)
+            Err(Error::no_data_found())
         }
     }
 
@@ -291,12 +296,12 @@ impl Collection {
         let mut exists = 0;
         chkerr!(
             self.ctxt(),
-            dpiObject_getNextIndex(self.handle, index, &mut next, &mut exists)
+            dpiObject_getNextIndex(self.handle(), index, &mut next, &mut exists)
         );
         if exists != 0 {
             Ok(next)
         } else {
-            Err(Error::NoDataFound)
+            Err(Error::no_data_found())
         }
     }
 
@@ -308,12 +313,12 @@ impl Collection {
         let mut exists = 0;
         chkerr!(
             self.ctxt(),
-            dpiObject_getPrevIndex(self.handle, index, &mut prev, &mut exists)
+            dpiObject_getPrevIndex(self.handle(), index, &mut prev, &mut exists)
         );
         if exists != 0 {
             Ok(prev)
         } else {
-            Err(Error::NoDataFound)
+            Err(Error::no_data_found())
         }
     }
 
@@ -322,7 +327,7 @@ impl Collection {
         let mut exists = 0;
         chkerr!(
             self.ctxt(),
-            dpiObject_getElementExistsByIndex(self.handle, index, &mut exists)
+            dpiObject_getElementExistsByIndex(self.handle(), index, &mut exists)
         );
         Ok(exists != 0)
     }
@@ -341,13 +346,22 @@ impl Collection {
             },
             _ => (),
         }
-        let sql_value = SqlValue::from_oratype(self.conn.clone(), oratype, &mut data)?;
-        let native_type_num = sql_value.native_type_num();
-        chkerr!(
-            self.ctxt(),
-            dpiObject_getElementValueByIndex(self.handle, index, native_type_num, &mut data)
-        );
-        let res = sql_value.get();
+        let res;
+        let native_type_num;
+        {
+            let sql_value = SqlValue::from_oratype(self.conn.clone(), oratype, &mut data)?;
+            native_type_num = sql_value.native_type_num();
+            chkerr!(
+                self.ctxt(),
+                dpiObject_getElementValueByIndex(
+                    self.handle(),
+                    index,
+                    native_type_num,
+                    sql_value.data()?
+                )
+            );
+            res = sql_value.get();
+        }
         unsafe { release_dpi_data(&data, native_type_num) };
         res
     }
@@ -361,10 +375,10 @@ impl Collection {
         chkerr!(
             self.ctxt(),
             dpiObject_setElementValueByIndex(
-                self.handle,
+                self.handle(),
                 index,
                 sql_value.native_type_num(),
-                &mut data
+                sql_value.data()?
             )
         );
         Ok(())
@@ -378,7 +392,11 @@ impl Collection {
         sql_value.set(value)?;
         chkerr!(
             self.ctxt(),
-            dpiObject_appendElement(self.handle, sql_value.native_type_num(), &mut data)
+            dpiObject_appendElement(
+                self.handle(),
+                sql_value.native_type_num(),
+                sql_value.data()?
+            )
         );
         Ok(())
     }
@@ -389,7 +407,7 @@ impl Collection {
     pub fn remove(&mut self, index: i32) -> Result<()> {
         chkerr!(
             self.ctxt(),
-            dpiObject_deleteElementByIndex(self.handle, index)
+            dpiObject_deleteElementByIndex(self.handle(), index)
         );
         Ok(())
     }
@@ -399,21 +417,14 @@ impl Collection {
     /// If the number of of elements to trim exceeds the current size
     /// of the collection an error is returned.
     pub fn trim(&mut self, len: usize) -> Result<()> {
-        chkerr!(self.ctxt(), dpiObject_trim(self.handle, len as u32));
+        chkerr!(self.ctxt(), dpiObject_trim(self.handle(), len as u32));
         Ok(())
     }
 }
 
 impl Clone for Collection {
     fn clone(&self) -> Collection {
-        unsafe { dpiObject_addRef(self.handle) };
-        Collection::new(self.conn.clone(), self.handle, self.objtype.clone())
-    }
-}
-
-impl Drop for Collection {
-    fn drop(&mut self) {
-        let _ = unsafe { dpiObject_release(self.handle) };
+        Collection::new(self.conn.clone(), self.handle.clone(), self.objtype.clone())
     }
 }
 
@@ -472,6 +483,8 @@ impl fmt::Debug for Collection {
     }
 }
 
+impl AssertSend for Collection {}
+
 /// Oracle-specific object data type
 ///
 /// ```no_run
@@ -501,12 +514,12 @@ impl fmt::Debug for Collection {
 /// Note: Methods in the type may be changed in future.
 pub struct Object {
     conn: Conn,
-    pub(crate) handle: *mut dpiObject,
+    pub(crate) handle: DpiObject,
     objtype: ObjectType,
 }
 
 impl Object {
-    pub(crate) fn new(conn: Conn, handle: *mut dpiObject, objtype: ObjectType) -> Object {
+    pub(crate) fn new(conn: Conn, handle: DpiObject, objtype: ObjectType) -> Object {
         Object {
             conn,
             handle,
@@ -516,6 +529,10 @@ impl Object {
 
     pub(crate) fn ctxt(&self) -> &Context {
         self.conn.ctxt()
+    }
+
+    pub(crate) fn handle(&self) -> *mut dpiObject {
+        self.handle.raw
     }
 
     /// Returns type information.
@@ -529,7 +546,7 @@ impl Object {
                 return Ok(attr);
             }
         }
-        Err(Error::InvalidAttributeName(name.to_string()))
+        Err(Error::invalid_attribute_name(name))
     }
 
     pub(crate) fn get_by_attr<T>(&self, attr: &ObjectTypeAttr) -> Result<T>
@@ -544,13 +561,22 @@ impl Object {
             },
             _ => (),
         }
-        let sql_value = SqlValue::from_oratype(self.conn.clone(), &attr.oratype, &mut data)?;
-        let native_type_num = sql_value.native_type_num();
-        chkerr!(
-            self.ctxt(),
-            dpiObject_getAttributeValue(self.handle, attr.handle.raw(), native_type_num, &mut data)
-        );
-        let res = sql_value.get();
+        let res;
+        let native_type_num;
+        {
+            let sql_value = SqlValue::from_oratype(self.conn.clone(), &attr.oratype, &mut data)?;
+            native_type_num = sql_value.native_type_num();
+            chkerr!(
+                self.ctxt(),
+                dpiObject_getAttributeValue(
+                    self.handle(),
+                    attr.handle.raw(),
+                    native_type_num,
+                    sql_value.data()?
+                )
+            );
+            res = sql_value.get();
+        }
         unsafe { release_dpi_data(&data, native_type_num) };
         res
     }
@@ -573,10 +599,10 @@ impl Object {
         chkerr!(
             self.ctxt(),
             dpiObject_setAttributeValue(
-                self.handle,
+                self.handle(),
                 attrtype.handle.raw(),
                 sql_value.native_type_num(),
-                &mut data
+                sql_value.data()?
             )
         );
         Ok(())
@@ -585,14 +611,7 @@ impl Object {
 
 impl Clone for Object {
     fn clone(&self) -> Object {
-        unsafe { dpiObject_addRef(self.handle) };
-        Object::new(self.conn.clone(), self.handle, self.objtype.clone())
-    }
-}
-
-impl Drop for Object {
-    fn drop(&mut self) {
-        let _ = unsafe { dpiObject_release(self.handle) };
+        Object::new(self.conn.clone(), self.handle.clone(), self.objtype.clone())
     }
 }
 
@@ -643,6 +662,8 @@ impl fmt::Debug for Object {
         write!(f, "))")
     }
 }
+
+impl AssertSend for Object {}
 
 /// Type information about Object or Collection data type
 ///
@@ -757,17 +778,17 @@ impl ObjectType {
     /// Create a new Oracle object.
     pub fn new_object(&self) -> Result<Object> {
         if self.is_collection() {
-            return Err(Error::InvalidOperation(format!(
+            return Err(Error::invalid_operation(format!(
                 "{}.{} isn't object type.",
                 self.schema(),
                 self.name()
             )));
         }
         let conn = &self.internal.conn;
-        let mut handle = ptr::null_mut();
+        let mut handle = DpiObject::null();
         chkerr!(
             conn.ctxt(),
-            dpiObjectType_createObject(self.internal.handle.raw(), &mut handle)
+            dpiObjectType_createObject(self.internal.handle.raw(), &mut handle.raw)
         );
         Ok(Object::new(conn.clone(), handle, self.clone()))
     }
@@ -775,17 +796,17 @@ impl ObjectType {
     /// Create a new collection.
     pub fn new_collection(&self) -> Result<Collection> {
         if !self.is_collection() {
-            return Err(Error::InvalidOperation(format!(
+            return Err(Error::invalid_operation(format!(
                 "{}.{} isn't collection type.",
                 self.schema(),
                 self.name()
             )));
         }
         let conn = &self.internal.conn;
-        let mut handle = ptr::null_mut();
+        let mut handle = DpiObject::null();
         chkerr!(
             conn.ctxt(),
-            dpiObjectType_createObject(self.internal.handle.raw(), &mut handle)
+            dpiObjectType_createObject(self.internal.handle.raw(), &mut handle.raw)
         );
         Ok(Collection::new(conn.clone(), handle, self.clone()))
     }
